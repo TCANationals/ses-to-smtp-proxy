@@ -200,7 +200,8 @@ the proxy's local SMTP listener:
 | --- | --- |
 | Type | Custom |
 | Address space | SMTP, `*`, cost 1 |
-| Smart host | `127.0.0.1` (or the proxy host) on port `2525` |
+| Smart host | `[127.0.0.1]` (or the proxy host as an FQDN) |
+| Smart host port | `2525` (set via `-Port`) |
 | Smart host auth | None |
 | Source servers | The Exchange server(s) authorised to relay |
 
@@ -218,7 +219,8 @@ New-SendConnector `
     -Usage Custom `
     -AddressSpaces "SMTP:*;1" `
     -DNSRoutingEnabled $false `
-    -SmartHosts "[127.0.0.1]:2525" `
+    -SmartHosts "[127.0.0.1]" `
+    -Port 2525 `
     -SmartHostAuthMechanism None `
     -SourceTransportServers (Get-TransportService | Select-Object -ExpandProperty Name) `
     -ProtocolLoggingLevel Verbose `
