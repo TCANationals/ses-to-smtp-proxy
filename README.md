@@ -11,14 +11,14 @@ between SES and Exchange over private outbound connections only.
 
 - **Single static `.exe`**, no runtime dependencies.
 - **Runs as a Windows service**, registered automatically by the installer.
-- **YAML configuration on disk**, alongside the executable (default
-  `C:\Program Files\ses-smtp-proxy\config.yaml`).
+- **JSON configuration on disk**, alongside the executable (default
+  `C:\Program Files\ses-smtp-proxy\config.json`).
 - **Logs to the Windows Event Log** by default, or to a rotated file when
   configured.
 - **One-click NSIS installer** that registers the service, opens the
   firewall, and seeds a starter config.
 - **CloudFormation template** that provisions the entire AWS side and emits a
-  drop-in `config.yaml` as a stack output.
+  drop-in `config.json` as a stack output.
 
 ## Table of contents
 
@@ -104,19 +104,21 @@ outbound HTTPS to SES/SQS/S3 and the loopback/LAN SMTP listener for Exchange.
          AlarmEmail=ops@example.com
    ```
 
-4. Retrieve the rendered `config.yaml` directly from the stack output. Run
+4. Retrieve the rendered `config.json` directly from the stack output. Run
    this on the Exchange host once the installer has placed the binary there:
 
    ```powershell
    aws cloudformation describe-stacks `
      --stack-name ses-smtp-proxy `
      --region us-east-1 `
-     --query "Stacks[0].Outputs[?OutputKey=='ConfigYaml'].OutputValue" `
-     --output text | Set-Content "C:\Program Files\ses-smtp-proxy\config.yaml"
+     --query "Stacks[0].Outputs[?OutputKey=='ConfigJson'].OutputValue" `
+     --output text | Set-Content "C:\Program Files\ses-smtp-proxy\config.json"
    ```
 
    The result is a complete configuration file with the queue URL, S3 bucket,
-   region, access key, and secret already filled in.
+   region, access key, and secret already filled in. You can also copy the
+   value straight out of the `ConfigJson` row on the stack's **Outputs** tab
+   in the AWS Console.
 
 ### Resources provisioned
 
@@ -160,13 +162,13 @@ SES drops inbound mail and rejects outbound `SendEmail` calls.
    - **Service binary** (required) — copies `ses-smtp-proxy.exe`, registers
      the Windows service with auto-start and on-failure restart, and
      registers an Event Log source.
-   - **Sample config.yaml** — seeds a starter `config.yaml` in the install
+   - **Sample config.json** — seeds a starter `config.json` in the install
      directory only when none is already present (upgrades preserve operator
      edits).
    - **Windows Firewall: inbound SMTP** — opens TCP/2525 inbound for the
      local SMTP listener.
 3. Save the CloudFormation-rendered config from the previous section to
-   `C:\Program Files\ses-smtp-proxy\config.yaml`, overwriting the seeded
+   `C:\Program Files\ses-smtp-proxy\config.json`, overwriting the seeded
    sample.
 4. Edit `outbound.allowedCidrs` in the config to include the Exchange Send
    Connector source IP (typically the Exchange server itself).
@@ -237,8 +239,8 @@ Send-MailMessage `
 
 ## Configuration reference
 
-Full annotated sample lives in [`config.example.yaml`](config.example.yaml).
-Key fields:
+Full sample lives in [`config.example.json`](config.example.json). Key
+fields (JSON does not support comments, so the documentation is here):
 
 ### `aws`
 
@@ -267,7 +269,7 @@ Key fields:
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `listen` | `0.0.0.0:2525` | Address Exchange's Send Connector relays to. |
+| `listen` | `127.0.0.1:2525` | Address Exchange's Send Connector relays to. |
 | `allowedCidrs` | _required_ | Connection source must match one of these CIDRs; everything else gets `554`. |
 | `maxMessageBytes` | `41943040` (40 MiB) | SES inbound cap. |
 | `tls.certFile` / `keyFile` | empty | Optional STARTTLS for the Exchange -> proxy hop. Leave empty on a trusted localhost link. |
@@ -316,7 +318,7 @@ inspect them.
 ### Forcing a config reload
 
 The service reads its configuration only at startup. Restart the service
-after editing `config.yaml`:
+after editing `config.json`:
 
 ```powershell
 sc.exe stop ses-smtp-proxy
@@ -327,7 +329,7 @@ sc.exe start ses-smtp-proxy
 
 | Symptom | Likely cause |
 | --- | --- |
-| Service exits immediately after start | `config.yaml` missing or fails validation. Run `ses-smtp-proxy.exe debug` from an Administrator prompt to see the error on stderr. |
+| Service exits immediately after start | `config.json` missing or fails validation. Run `ses-smtp-proxy.exe debug` from an Administrator prompt to see the error on stderr. |
 | `Source IP not permitted to relay` (554) on outbound | The Exchange Send Connector source isn't covered by `outbound.allowedCidrs`. |
 | Inbound mail accepted by SES but never reaches Exchange | Check the DLQ depth. Common causes: Exchange Receive Connector rejecting the proxy (allow it as an internal relay), STARTTLS cert untrusted (set `insecureSkipVerify: true` for testing), Exchange refusing the recipient. |
 | `MailFromDomainNotVerifiedException` from SES | DKIM records haven't propagated yet, or the `From` header uses a domain other than the verified one. |
@@ -373,8 +375,8 @@ cfn-lint cloudformation/template.yaml
   performs no privileged operations beyond binding its configured SMTP port.
   You can `sc config ses-smtp-proxy obj= "NT SERVICE\ses-smtp-proxy"` or a
   dedicated service account if your policy requires it.
-- AWS credentials live only in `config.yaml` next to the executable
-  (typically `C:\Program Files\ses-smtp-proxy\config.yaml`), which inherits
+- AWS credentials live only in `config.json` next to the executable
+  (typically `C:\Program Files\ses-smtp-proxy\config.json`), which inherits
   the default Program Files ACL (administrators read/write, users read).
   Tighten the ACL with `icacls` if read access for `Users` is undesirable.
 - The IAM policy attached to the service user is least-privilege: it cannot

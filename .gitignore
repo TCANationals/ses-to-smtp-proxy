@@ -14,10 +14,8 @@
 coverage.txt
 
 # Local config (never commit real credentials)
-config.yaml
-config.yml
-!installer/config.example.yaml
-!config.example.yaml
+config.json
+!config.example.json
 
 # Editor / IDE
 .vscode/

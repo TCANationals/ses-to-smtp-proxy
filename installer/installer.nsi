@@ -75,7 +75,7 @@ VIAddVersionKey "LegalCopyright"  "MIT-licensed open source software"
 !define MUI_FINISHPAGE_RUN_NOTCHECKED
 !define MUI_FINISHPAGE_SHOWREADME ""
 !define MUI_FINISHPAGE_SHOWREADME_NOTCHECKED
-!define MUI_FINISHPAGE_SHOWREADME_TEXT "Open config.yaml in Notepad"
+!define MUI_FINISHPAGE_SHOWREADME_TEXT "Open config.json in Notepad"
 !define MUI_FINISHPAGE_SHOWREADME_FUNCTION OpenConfigInNotepad
 !insertmacro MUI_PAGE_FINISH
 
@@ -92,7 +92,7 @@ Var PreviousInstallDir
 Var ConfigPath
 
 Function .onInit
-  StrCpy $ConfigPath "$INSTDIR\config.yaml"
+  StrCpy $ConfigPath "$INSTDIR\config.json"
 
   ; Detect a previous installation so we can stop+uninstall the old service
   ; before overwriting the exe.
@@ -102,7 +102,7 @@ FunctionEnd
 ; $INSTDIR is finalised after the directory page, so refresh $ConfigPath
 ; before we use it during install.
 Function .onVerifyInstDir
-  StrCpy $ConfigPath "$INSTDIR\config.yaml"
+  StrCpy $ConfigPath "$INSTDIR\config.json"
 FunctionEnd
 
 ;------------------------------------------------------------------------------
@@ -127,7 +127,7 @@ Section "Service binary (required)" SecService
   File /oname=${EXE_NAME} "${EXE_PATH}"
 
   ; Make sure $ConfigPath reflects the user-chosen $INSTDIR.
-  StrCpy $ConfigPath "$INSTDIR\config.yaml"
+  StrCpy $ConfigPath "$INSTDIR\config.json"
 
   ; Register the Windows service. This also installs an Event Log source so
   ; structured logging routes through the Windows Event Log when no
@@ -159,13 +159,13 @@ Section "Service binary (required)" SecService
   WriteUninstaller "$INSTDIR\uninstall.exe"
 SectionEnd
 
-Section "Sample config.yaml" SecConfig
-  ; Seed a starter config.yaml only when none is already present, so upgrades
+Section "Sample config.json" SecConfig
+  ; Seed a starter config.json only when none is already present, so upgrades
   ; preserve operator edits.
   ${IfNot} ${FileExists} "$ConfigPath"
     DetailPrint "Seeding $ConfigPath ..."
     SetOutPath "$INSTDIR"
-    File /oname=config.yaml "..\config.example.yaml"
+    File /oname=config.json "..\config.example.json"
   ${Else}
     DetailPrint "Existing $ConfigPath preserved."
   ${EndIf}
@@ -184,7 +184,7 @@ SectionEnd
 ;------------------------------------------------------------------------------
 
 LangString DESC_SecService  ${LANG_ENGLISH} "Install ${EXE_NAME} and register the Windows service. Required."
-LangString DESC_SecConfig   ${LANG_ENGLISH} "Place a starter config.yaml in the install directory. Skipped if a config already exists."
+LangString DESC_SecConfig   ${LANG_ENGLISH} "Place a starter config.json in the install directory. Skipped if a config already exists."
 LangString DESC_SecFirewall ${LANG_ENGLISH} "Allow inbound TCP/${DEFAULT_SMTP_PORT} so Exchange can relay outbound mail to the proxy."
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
@@ -224,12 +224,12 @@ Section "Uninstall"
   Delete "$INSTDIR\${EXE_NAME}"
   Delete "$INSTDIR\uninstall.exe"
 
-  ; Intentionally preserve $INSTDIR\config.yaml so operator edits are not
+  ; Intentionally preserve $INSTDIR\config.json so operator edits are not
   ; destroyed by an uninstall. RMDir without /r only removes the directory
-  ; when it is empty - so if the operator has deleted config.yaml beforehand,
+  ; when it is empty - so if the operator has deleted config.json beforehand,
   ; the install dir is cleaned up; otherwise it (and the config) survive.
-  ${If} ${FileExists} "$INSTDIR\config.yaml"
-    DetailPrint "Preserved $INSTDIR\config.yaml. Delete it manually if no longer needed."
+  ${If} ${FileExists} "$INSTDIR\config.json"
+    DetailPrint "Preserved $INSTDIR\config.json. Delete it manually if no longer needed."
   ${EndIf}
   RMDir "$INSTDIR"
 

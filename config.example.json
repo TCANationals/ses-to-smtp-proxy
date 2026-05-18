@@ -1,0 +1,42 @@
+{
+  "aws": {
+    "region": "us-east-1",
+    "accessKeyId": "",
+    "secretAccessKey": "",
+    "profile": ""
+  },
+  "inbound": {
+    "sqsQueueUrl": "https://sqs.us-east-1.amazonaws.com/123456789012/ses-smtp-proxy-inbound",
+    "s3Bucket": "",
+    "pollWaitSeconds": 20,
+    "maxConcurrent": 4,
+    "visibilityTimeoutSeconds": 300,
+    "exchange": {
+      "host": "127.0.0.1",
+      "port": 25,
+      "starttls": true,
+      "insecureSkipVerify": false,
+      "heloDomain": "ses-smtp-proxy.local",
+      "username": "",
+      "password": ""
+    }
+  },
+  "outbound": {
+    "listen": "127.0.0.1:2525",
+    "allowedCidrs": [
+      "127.0.0.1/32"
+    ],
+    "maxMessageBytes": 41943040,
+    "tls": {
+      "certFile": "",
+      "keyFile": ""
+    }
+  },
+  "logging": {
+    "level": "info",
+    "file": "",
+    "maxSizeMB": 50,
+    "maxBackups": 5,
+    "maxAgeDays": 30
+  }
+}

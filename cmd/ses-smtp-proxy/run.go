@@ -174,7 +174,7 @@ func controlService(action, cfgPath string, extra []string) error {
 		if _, err := config.Resolve(cfgPath); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 			fmt.Fprintln(os.Stderr,
-				"the service will fail to start until a config.yaml is placed next to the executable")
+				"the service will fail to start until a config.json is placed next to the executable")
 		}
 	}
 

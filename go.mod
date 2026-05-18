@@ -13,7 +13,6 @@ require (
 	github.com/emersion/go-smtp v0.24.0
 	github.com/kardianos/service v1.2.4
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

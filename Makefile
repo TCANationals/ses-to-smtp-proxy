@@ -13,7 +13,7 @@ BIN_NAME     := ses-smtp-proxy
 BIN_DIR      := bin
 DIST_DIR     := dist
 VERSION      ?= dev
-CONFIG       ?= config.yaml
+CONFIG       ?= config.json
 LDFLAGS      := -s -w -X main.version=$(VERSION)
 
 # Cross-compile defaults; override on the command line for one-offs:
@@ -67,7 +67,7 @@ installer: build-windows ## Build the NSIS installer for windows/$(ARCH) (requir
 # Run
 # ----------------------------------------------------------------------
 
-debug: ## Run the service in the foreground with logs on stderr. CONFIG=path/to/config.yaml to override.
+debug: ## Run the service in the foreground with logs on stderr. CONFIG=path/to/config.json to override.
 	go run $(CMD_PKG) debug --config $(CONFIG)
 
 run: debug ## Alias for `make debug`.

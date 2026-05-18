@@ -1,7 +1,9 @@
-// Package config loads and validates the ses-smtp-proxy YAML configuration.
+// Package config loads and validates the ses-smtp-proxy JSON configuration.
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -9,82 +11,80 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 )
 
 // DefaultFileName is the basename of the configuration file the service
 // looks for next to the running executable.
-const DefaultFileName = "config.yaml"
+const DefaultFileName = "config.json"
 
 // Config is the top-level configuration object.
 type Config struct {
-	AWS      AWSConfig      `yaml:"aws"`
-	Inbound  InboundConfig  `yaml:"inbound"`
-	Outbound OutboundConfig `yaml:"outbound"`
-	Logging  LoggingConfig  `yaml:"logging"`
+	AWS      AWSConfig      `json:"aws"`
+	Inbound  InboundConfig  `json:"inbound"`
+	Outbound OutboundConfig `json:"outbound"`
+	Logging  LoggingConfig  `json:"logging"`
 
 	// Path is the absolute path the configuration was loaded from. Useful for
 	// log messages.
-	Path string `yaml:"-"`
+	Path string `json:"-"`
 }
 
 // AWSConfig holds shared AWS SDK settings. All fields are optional; if no
 // static credentials are supplied the default credential chain is used.
 type AWSConfig struct {
-	Region          string `yaml:"region"`
-	AccessKeyID     string `yaml:"accessKeyId"`
-	SecretAccessKey string `yaml:"secretAccessKey"`
-	Profile         string `yaml:"profile"`
+	Region          string `json:"region"`
+	AccessKeyID     string `json:"accessKeyId"`
+	SecretAccessKey string `json:"secretAccessKey"`
+	Profile         string `json:"profile"`
 }
 
 // InboundConfig configures the SQS->SMTP relay direction.
 type InboundConfig struct {
-	SQSQueueURL              string         `yaml:"sqsQueueUrl"`
-	S3Bucket                 string         `yaml:"s3Bucket"`
-	PollWaitSeconds          int            `yaml:"pollWaitSeconds"`
-	MaxConcurrent            int            `yaml:"maxConcurrent"`
-	VisibilityTimeoutSeconds int            `yaml:"visibilityTimeoutSeconds"`
-	Exchange                 ExchangeConfig `yaml:"exchange"`
+	SQSQueueURL              string         `json:"sqsQueueUrl"`
+	S3Bucket                 string         `json:"s3Bucket"`
+	PollWaitSeconds          int            `json:"pollWaitSeconds"`
+	MaxConcurrent            int            `json:"maxConcurrent"`
+	VisibilityTimeoutSeconds int            `json:"visibilityTimeoutSeconds"`
+	Exchange                 ExchangeConfig `json:"exchange"`
 }
 
 // ExchangeConfig describes the on-premise Exchange SMTP target.
 type ExchangeConfig struct {
-	Host               string `yaml:"host"`
-	Port               int    `yaml:"port"`
-	StartTLS           bool   `yaml:"starttls"`
-	InsecureSkipVerify bool   `yaml:"insecureSkipVerify"`
-	HeloDomain         string `yaml:"heloDomain"`
-	Username           string `yaml:"username"`
-	Password           string `yaml:"password"`
+	Host               string `json:"host"`
+	Port               int    `json:"port"`
+	StartTLS           bool   `json:"starttls"`
+	InsecureSkipVerify bool   `json:"insecureSkipVerify"`
+	HeloDomain         string `json:"heloDomain"`
+	Username           string `json:"username"`
+	Password           string `json:"password"`
 }
 
 // OutboundConfig configures the local SMTP listener that relays mail out
 // through SES.
 type OutboundConfig struct {
-	Listen          string    `yaml:"listen"`
-	AllowedCIDRs    []string  `yaml:"allowedCidrs"`
-	MaxMessageBytes int64     `yaml:"maxMessageBytes"`
-	TLS             TLSConfig `yaml:"tls"`
+	Listen          string    `json:"listen"`
+	AllowedCIDRs    []string  `json:"allowedCidrs"`
+	MaxMessageBytes int64     `json:"maxMessageBytes"`
+	TLS             TLSConfig `json:"tls"`
 
 	// AllowedNets is the parsed form of AllowedCIDRs, populated by Validate.
-	AllowedNets []*net.IPNet `yaml:"-"`
+	AllowedNets []*net.IPNet `json:"-"`
 }
 
 // TLSConfig configures STARTTLS for the local SMTP listener. Both fields must
 // be set to enable TLS; leaving them empty disables STARTTLS.
 type TLSConfig struct {
-	CertFile string `yaml:"certFile"`
-	KeyFile  string `yaml:"keyFile"`
+	CertFile string `json:"certFile"`
+	KeyFile  string `json:"keyFile"`
 }
 
 // LoggingConfig configures slog output.
 type LoggingConfig struct {
-	Level      string `yaml:"level"`
-	File       string `yaml:"file"`
-	MaxSizeMB  int    `yaml:"maxSizeMB"`
-	MaxBackups int    `yaml:"maxBackups"`
-	MaxAgeDays int    `yaml:"maxAgeDays"`
+	Level      string `json:"level"`
+	File       string `json:"file"`
+	MaxSizeMB  int    `json:"maxSizeMB"`
+	MaxBackups int    `json:"maxBackups"`
+	MaxAgeDays int    `json:"maxAgeDays"`
 }
 
 // Load reads, parses, and validates the configuration. If explicitPath is
@@ -101,10 +101,13 @@ func Load(explicitPath string) (*Config, error) {
 	}
 
 	cfg := defaultConfig()
-	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
-	dec.KnownFields(true)
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
 	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("parse config %s: trailing data after the top-level object", path)
 	}
 	cfg.Path = path
 
@@ -118,7 +121,7 @@ func Load(explicitPath string) (*Config, error) {
 // documented search order:
 //
 //  1. explicitPath if non-empty
-//  2. config.yaml next to the running executable
+//  2. config.json next to the running executable
 func Resolve(explicitPath string) (string, error) {
 	if explicitPath != "" {
 		abs, err := filepath.Abs(explicitPath)
@@ -156,7 +159,7 @@ func defaultConfig() *Config {
 			},
 		},
 		Outbound: OutboundConfig{
-			Listen:          "0.0.0.0:2525",
+			Listen:          "127.0.0.1:2525",
 			MaxMessageBytes: 41943040,
 		},
 		Logging: LoggingConfig{
