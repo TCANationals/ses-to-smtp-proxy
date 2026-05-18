@@ -1,0 +1,34 @@
+# Build artifacts
+/dist/
+/bin/
+/build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test artifacts
+*.test
+*.out
+coverage.txt
+
+# Local config (never commit real credentials)
+config.yaml
+config.yml
+!installer/config.example.yaml
+!config.example.yaml
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# NSIS output
+installer/*-setup.exe
+installer/*.exe
+
+# Cursor / Claude scratch
+.cursor/
