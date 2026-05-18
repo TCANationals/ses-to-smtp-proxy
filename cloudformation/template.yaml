@@ -1,0 +1,486 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ses-smtp-proxy: provisions the AWS-side resources required to receive
+  email via Amazon SES and bridge it into an isolated network through the
+  ses-smtp-proxy Windows service. Creates an S3 bucket for inbound MIME,
+  an SNS topic + SQS queue (with DLQ), an SES domain identity and receipt
+  rule, and a dedicated IAM user with least-privilege credentials.
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: >
+      Domain emails are received on (e.g. contest.example.com). MX records
+      for this domain must be pointed at SES, and the DKIM CNAMEs from the
+      stack output must be added to your DNS provider.
+    AllowedPattern: "^[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$"
+    ConstraintDescription: "Must be a valid fully-qualified domain name."
+
+  ResourcePrefix:
+    Type: String
+    Default: ses-smtp-proxy
+    Description: Prefix applied to resource names created by this stack.
+    AllowedPattern: "^[a-z0-9-]{3,32}$"
+
+  S3RetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days raw inbound emails are retained in S3.
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Optional email address that receives a notification whenever the
+      inbound DLQ depth alarm fires. Leave blank to disable alarms.
+
+  SmtpExchangeHost:
+    Type: String
+    Default: 127.0.0.1
+    Description: Default value used in the rendered ConfigYaml output for inbound.exchange.host.
+
+  SmtpListenPort:
+    Type: Number
+    Default: 2525
+    Description: Default value used in the rendered ConfigYaml output for outbound.listen port.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Mappings:
+  # SES inbound endpoint hostnames. Receive is only available in these regions.
+  SesInbound:
+    us-east-1:        { Endpoint: "inbound-smtp.us-east-1.amazonaws.com" }
+    us-east-2:        { Endpoint: "inbound-smtp.us-east-2.amazonaws.com" }
+    us-west-2:        { Endpoint: "inbound-smtp.us-west-2.amazonaws.com" }
+    eu-west-1:        { Endpoint: "inbound-smtp.eu-west-1.amazonaws.com" }
+    eu-central-1:     { Endpoint: "inbound-smtp.eu-central-1.amazonaws.com" }
+    ap-south-1:       { Endpoint: "inbound-smtp.ap-south-1.amazonaws.com" }
+    ap-southeast-1:   { Endpoint: "inbound-smtp.ap-southeast-1.amazonaws.com" }
+    ap-southeast-2:   { Endpoint: "inbound-smtp.ap-southeast-2.amazonaws.com" }
+    ap-northeast-1:   { Endpoint: "inbound-smtp.ap-northeast-1.amazonaws.com" }
+    ca-central-1:     { Endpoint: "inbound-smtp.ca-central-1.amazonaws.com" }
+
+Resources:
+
+  ##########################################################################
+  # S3: raw inbound emails written by SES.
+  ##########################################################################
+
+  InboundBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ResourcePrefix}-inbound-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireInboundEmails
+            Status: Enabled
+            ExpirationInDays: !Ref S3RetentionDays
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+
+  InboundBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InboundBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSESPut
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${InboundBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ##########################################################################
+  # SNS: SES publishes per-receipt notifications here.
+  ##########################################################################
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-notifications"
+      DisplayName: SES inbound notifications
+
+  NotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref NotificationTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSESPublish
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref NotificationTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ##########################################################################
+  # SQS: subscribed to the notification topic; consumed by the proxy.
+  ##########################################################################
+
+  InboundDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ResourcePrefix}-inbound-dlq"
+      MessageRetentionPeriod: 1209600   # 14 days
+      SqsManagedSseEnabled: true
+
+  InboundQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ResourcePrefix}-inbound"
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 345600    # 4 days
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InboundDLQ.Arn
+        maxReceiveCount: 5
+
+  InboundQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref InboundQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSNSDeliver
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt InboundQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref NotificationTopic
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !GetAtt InboundQueue.Arn
+      RawMessageDelivery: true
+
+  ##########################################################################
+  # SES: domain identity + receipt rule set.
+  ##########################################################################
+
+  EmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref DomainName
+      DkimAttributes:
+        SigningEnabled: true
+
+  ReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties:
+      RuleSetName: !Sub "${ResourcePrefix}-rules"
+
+  InboundReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn:
+      - InboundBucketPolicy
+      - NotificationTopicPolicy
+    Properties:
+      RuleSetName: !Ref ReceiptRuleSet
+      Rule:
+        Name: deliver-to-s3
+        Enabled: true
+        ScanEnabled: true
+        TlsPolicy: Optional
+        Recipients:
+          - !Ref DomainName
+        Actions:
+          - S3Action:
+              BucketName: !Ref InboundBucket
+              TopicArn: !Ref NotificationTopic
+
+  ##########################################################################
+  # Custom resource: SES has no native CloudFormation resource for marking a
+  # rule set as the account's active rule set. A small inline Python Lambda
+  # calls SetActiveReceiptRuleSet on stack create/update and clears it on
+  # delete.
+  ##########################################################################
+
+  ActivateRuleSetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SetActiveReceiptRuleSet
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SetActiveReceiptRuleSet
+                  - ses:DescribeActiveReceiptRuleSet
+                Resource: "*"
+
+  ActivateRuleSetFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ResourcePrefix}-activate-ruleset"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ActivateRuleSetRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+
+          import boto3
+
+          ses = boto3.client("ses")
+
+          def send(event, status, reason="", data=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch log stream",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or event["LogicalResourceId"],
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode("utf-8")
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT")
+              req.add_header("Content-Type", "")
+              req.add_header("Content-Length", str(len(body)))
+              urllib.request.urlopen(req).read()
+
+          def handler(event, context):
+              try:
+                  rule_set = event["ResourceProperties"]["RuleSetName"]
+                  request = event["RequestType"]
+                  if request in ("Create", "Update"):
+                      ses.set_active_receipt_rule_set(RuleSetName=rule_set)
+                  elif request == "Delete":
+                      try:
+                          active = ses.describe_active_receipt_rule_set().get("Metadata") or {}
+                          if active.get("Name") == rule_set:
+                              ses.set_active_receipt_rule_set()
+                      except Exception:
+                          pass
+                  send(event, "SUCCESS", data={"RuleSetName": rule_set})
+              except Exception as exc:
+                  send(event, "FAILED", reason=str(exc))
+
+  ActivateRuleSet:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: InboundReceiptRule
+    Properties:
+      ServiceToken: !GetAtt ActivateRuleSetFunction.Arn
+      RuleSetName: !Ref ReceiptRuleSet
+
+  ##########################################################################
+  # IAM: dedicated user + access key for the on-prem proxy service.
+  ##########################################################################
+
+  ServiceUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${ResourcePrefix}-service"
+
+  ServicePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${ResourcePrefix}-service-policy"
+      Users:
+        - !Ref ServiceUser
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InboundQueue
+            Effect: Allow
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:ChangeMessageVisibility
+            Resource: !GetAtt InboundQueue.Arn
+          - Sid: InboundBucketRead
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub "${InboundBucket.Arn}/*"
+          - Sid: OutboundSendEmail
+            Effect: Allow
+            Action:
+              - ses:SendEmail
+              - ses:SendRawEmail
+            Resource: "*"
+            Condition:
+              StringLike:
+                ses:FromAddress: !Sub "*@${DomainName}"
+
+  ServiceAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref ServiceUser
+
+  ##########################################################################
+  # CloudWatch DLQ alarm (optional).
+  ##########################################################################
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      TopicName: !Sub "${ResourcePrefix}-alarms"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlarmEmail
+    Properties:
+      AlarmName: !Sub "${ResourcePrefix}-inbound-dlq-depth"
+      AlarmDescription: Triggers when undeliverable inbound emails accumulate in the DLQ.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt InboundDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+Outputs:
+
+  InboundMxRecord:
+    Description: >
+      MX record to add to your DNS provider for inbound mail. Priority is
+      conventionally 10.
+    Value: !Sub
+      - "10 ${Endpoint}"
+      - Endpoint: !FindInMap [SesInbound, !Ref AWS::Region, Endpoint]
+
+  DkimCnameRecord1:
+    Description: First DKIM CNAME record to add to DNS (Name -> Value).
+    Value: !Sub "${EmailIdentity.DkimDNSTokenName1} -> ${EmailIdentity.DkimDNSTokenValue1}"
+
+  DkimCnameRecord2:
+    Description: Second DKIM CNAME record to add to DNS (Name -> Value).
+    Value: !Sub "${EmailIdentity.DkimDNSTokenName2} -> ${EmailIdentity.DkimDNSTokenValue2}"
+
+  DkimCnameRecord3:
+    Description: Third DKIM CNAME record to add to DNS (Name -> Value).
+    Value: !Sub "${EmailIdentity.DkimDNSTokenName3} -> ${EmailIdentity.DkimDNSTokenValue3}"
+
+  S3BucketName:
+    Description: S3 bucket where SES writes raw inbound email.
+    Value: !Ref InboundBucket
+
+  SqsQueueUrl:
+    Description: SQS queue URL polled by the ses-smtp-proxy service.
+    Value: !Ref InboundQueue
+
+  SqsQueueArn:
+    Description: ARN of the inbound SQS queue.
+    Value: !GetAtt InboundQueue.Arn
+
+  DlqUrl:
+    Description: Dead-letter queue URL for inbound messages.
+    Value: !Ref InboundDLQ
+
+  ServiceUserName:
+    Description: IAM user the proxy service authenticates as.
+    Value: !Ref ServiceUser
+
+  AccessKeyId:
+    Description: Access key ID for the proxy service IAM user.
+    Value: !Ref ServiceAccessKey
+
+  SecretAccessKey:
+    Description: >
+      Secret access key for the proxy service IAM user. Treat as sensitive;
+      retrieve via "aws cloudformation describe-stacks" and store securely.
+    Value: !GetAtt ServiceAccessKey.SecretAccessKey
+
+  ConfigYaml:
+    Description: >
+      Complete, drop-in config.yaml for the ses-smtp-proxy Windows service.
+      Save the value directly to C:\ProgramData\ses-smtp-proxy\config.yaml.
+      Edit only outbound.allowedCidrs and (optionally) inbound.exchange.*
+      for your environment.
+    Value: !Sub
+      - |
+        # Generated by CloudFormation stack ${AWS::StackName}.
+        # Edit outbound.allowedCidrs to add the Exchange relay source CIDR(s).
+        aws:
+          region: ${AWS::Region}
+          accessKeyId: ${AccessKeyId}
+          secretAccessKey: ${SecretAccessKey}
+          profile: ""
+        inbound:
+          sqsQueueUrl: ${QueueUrl}
+          s3Bucket: ${BucketName}
+          pollWaitSeconds: 20
+          maxConcurrent: 4
+          visibilityTimeoutSeconds: 300
+          exchange:
+            host: ${SmtpExchangeHost}
+            port: 25
+            starttls: true
+            insecureSkipVerify: false
+            heloDomain: ${DomainName}
+            username: ""
+            password: ""
+        outbound:
+          listen: "0.0.0.0:${SmtpListenPort}"
+          allowedCidrs:
+            - 127.0.0.1/32   # EDIT: add Exchange relay source CIDR(s)
+          maxMessageBytes: 41943040
+          tls:
+            certFile: ""
+            keyFile: ""
+        logging:
+          level: info
+          file: ""           # empty -> Windows Event Log
+          maxSizeMB: 50
+          maxBackups: 5
+          maxAgeDays: 30
+      - AccessKeyId: !Ref ServiceAccessKey
+        SecretAccessKey: !GetAtt ServiceAccessKey.SecretAccessKey
+        QueueUrl: !Ref InboundQueue
+        BucketName: !Ref InboundBucket

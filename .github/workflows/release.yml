@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag version to release (e.g. v1.2.3)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: install NSIS
+        run: sudo apt-get update && sudo apt-get install -y nsis
+
+      - name: build Windows binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            echo "::group::build windows/${arch}"
+            GOOS=windows GOARCH=${arch} CGO_ENABLED=0 \
+              go build -trimpath \
+                -ldflags "-s -w -X main.version=${VERSION}" \
+                -o "dist/ses-smtp-proxy-${arch}.exe" \
+                ./cmd/ses-smtp-proxy
+            echo "::endgroup::"
+          done
+
+      - name: build NSIS installers
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for arch in amd64 arm64; do
+            echo "::group::makensis ${arch}"
+            makensis -V2 \
+              -DVERSION=${VERSION} \
+              -DARCH=${arch} \
+              -DEXE_PATH=../dist/ses-smtp-proxy-${arch}.exe \
+              -DOUT_FILE=../dist/ses-smtp-proxy-${VERSION}-${arch}-setup.exe \
+              installer/installer.nsi
+            echo "::endgroup::"
+          done
+
+      # Optional: sign installers with signtool when SIGNING_PFX_BASE64 and
+      # SIGNING_PFX_PASSWORD secrets are configured. Disabled by default so
+      # the workflow works in unsigned-fork repos.
+      #
+      # - name: sign installers
+      #   if: secrets.SIGNING_PFX_BASE64 != ''
+      #   uses: dlemstra/code-sign-action@v1
+      #   with:
+      #     certificate: ${{ secrets.SIGNING_PFX_BASE64 }}
+      #     password: ${{ secrets.SIGNING_PFX_PASSWORD }}
+      #     folder: dist
+      #     recursive: false
+      #     description: "ses-smtp-proxy"
+
+      - name: copy CloudFormation template into release assets
+        run: cp cloudformation/template.yaml dist/cloudformation.yaml
+
+      - name: SHA256SUMS
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: list release artifacts
+        run: ls -la dist/
+
+      - name: publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/ses-smtp-proxy-${{ steps.version.outputs.version }}-amd64-setup.exe
+            dist/ses-smtp-proxy-${{ steps.version.outputs.version }}-arm64-setup.exe
+            dist/ses-smtp-proxy-amd64.exe
+            dist/ses-smtp-proxy-arm64.exe
+            dist/cloudformation.yaml
+            dist/SHA256SUMS

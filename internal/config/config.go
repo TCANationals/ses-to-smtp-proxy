@@ -1,0 +1,261 @@
+// Package config loads and validates the ses-smtp-proxy YAML configuration.
+package config
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+// ProgramDataPath is the default Windows location for the configuration file.
+// It is also writable by the installer to seed config.yaml on first install.
+const ProgramDataPath = `C:\ProgramData\ses-smtp-proxy\config.yaml`
+
+// Config is the top-level configuration object.
+type Config struct {
+	AWS      AWSConfig      `yaml:"aws"`
+	Inbound  InboundConfig  `yaml:"inbound"`
+	Outbound OutboundConfig `yaml:"outbound"`
+	Logging  LoggingConfig  `yaml:"logging"`
+
+	// Path is the absolute path the configuration was loaded from. Useful for
+	// log messages.
+	Path string `yaml:"-"`
+}
+
+// AWSConfig holds shared AWS SDK settings. All fields are optional; if no
+// static credentials are supplied the default credential chain is used.
+type AWSConfig struct {
+	Region          string `yaml:"region"`
+	AccessKeyID     string `yaml:"accessKeyId"`
+	SecretAccessKey string `yaml:"secretAccessKey"`
+	Profile         string `yaml:"profile"`
+}
+
+// InboundConfig configures the SQS->SMTP relay direction.
+type InboundConfig struct {
+	SQSQueueURL              string         `yaml:"sqsQueueUrl"`
+	S3Bucket                 string         `yaml:"s3Bucket"`
+	PollWaitSeconds          int            `yaml:"pollWaitSeconds"`
+	MaxConcurrent            int            `yaml:"maxConcurrent"`
+	VisibilityTimeoutSeconds int            `yaml:"visibilityTimeoutSeconds"`
+	Exchange                 ExchangeConfig `yaml:"exchange"`
+}
+
+// ExchangeConfig describes the on-premise Exchange SMTP target.
+type ExchangeConfig struct {
+	Host               string `yaml:"host"`
+	Port               int    `yaml:"port"`
+	StartTLS           bool   `yaml:"starttls"`
+	InsecureSkipVerify bool   `yaml:"insecureSkipVerify"`
+	HeloDomain         string `yaml:"heloDomain"`
+	Username           string `yaml:"username"`
+	Password           string `yaml:"password"`
+}
+
+// OutboundConfig configures the local SMTP listener that relays mail out
+// through SES.
+type OutboundConfig struct {
+	Listen          string    `yaml:"listen"`
+	AllowedCIDRs    []string  `yaml:"allowedCidrs"`
+	MaxMessageBytes int64     `yaml:"maxMessageBytes"`
+	TLS             TLSConfig `yaml:"tls"`
+
+	// AllowedNets is the parsed form of AllowedCIDRs, populated by Validate.
+	AllowedNets []*net.IPNet `yaml:"-"`
+}
+
+// TLSConfig configures STARTTLS for the local SMTP listener. Both fields must
+// be set to enable TLS; leaving them empty disables STARTTLS.
+type TLSConfig struct {
+	CertFile string `yaml:"certFile"`
+	KeyFile  string `yaml:"keyFile"`
+}
+
+// LoggingConfig configures slog output.
+type LoggingConfig struct {
+	Level      string `yaml:"level"`
+	File       string `yaml:"file"`
+	MaxSizeMB  int    `yaml:"maxSizeMB"`
+	MaxBackups int    `yaml:"maxBackups"`
+	MaxAgeDays int    `yaml:"maxAgeDays"`
+}
+
+// Load reads, parses, and validates the configuration. If explicitPath is
+// empty, Resolve is used to find a configuration file.
+func Load(explicitPath string) (*Config, error) {
+	path, err := Resolve(explicitPath)
+	if err != nil {
+		return nil, err
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+
+	cfg := defaultConfig()
+	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	cfg.Path = path
+
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("validate config %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+// Resolve returns the absolute path of the configuration file using the
+// documented search order:
+//
+//  1. explicitPath if non-empty
+//  2. config.yaml next to the running executable
+//  3. C:\ProgramData\ses-smtp-proxy\config.yaml (Windows default)
+func Resolve(explicitPath string) (string, error) {
+	if explicitPath != "" {
+		abs, err := filepath.Abs(explicitPath)
+		if err != nil {
+			return "", fmt.Errorf("resolve --config: %w", err)
+		}
+		if _, err := os.Stat(abs); err != nil {
+			return "", fmt.Errorf("config file %s: %w", abs, err)
+		}
+		return abs, nil
+	}
+
+	if exe, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(exe), "config.yaml")
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			return candidate, nil
+		}
+	}
+
+	if _, err := os.Stat(ProgramDataPath); err == nil {
+		return ProgramDataPath, nil
+	}
+
+	return "", fmt.Errorf("no config file found (tried exe-dir/config.yaml and %s)", ProgramDataPath)
+}
+
+func defaultConfig() *Config {
+	return &Config{
+		Inbound: InboundConfig{
+			PollWaitSeconds:          20,
+			MaxConcurrent:            4,
+			VisibilityTimeoutSeconds: 300,
+			Exchange: ExchangeConfig{
+				Host:       "127.0.0.1",
+				Port:       25,
+				StartTLS:   true,
+				HeloDomain: "ses-smtp-proxy.local",
+			},
+		},
+		Outbound: OutboundConfig{
+			Listen:          "0.0.0.0:2525",
+			MaxMessageBytes: 41943040,
+		},
+		Logging: LoggingConfig{
+			Level:      "info",
+			MaxSizeMB:  50,
+			MaxBackups: 5,
+			MaxAgeDays: 30,
+		},
+	}
+}
+
+// Validate checks the configuration and populates derived fields.
+func (c *Config) Validate() error {
+	var errs []string
+
+	if c.AWS.Region == "" {
+		errs = append(errs, "aws.region is required")
+	}
+	if (c.AWS.AccessKeyID == "") != (c.AWS.SecretAccessKey == "") {
+		errs = append(errs, "aws.accessKeyId and aws.secretAccessKey must both be set or both empty")
+	}
+
+	if c.Inbound.SQSQueueURL == "" {
+		errs = append(errs, "inbound.sqsQueueUrl is required")
+	} else if u, err := url.Parse(c.Inbound.SQSQueueURL); err != nil || u.Scheme == "" || u.Host == "" {
+		errs = append(errs, "inbound.sqsQueueUrl is not a valid URL")
+	}
+	if c.Inbound.PollWaitSeconds < 0 || c.Inbound.PollWaitSeconds > 20 {
+		errs = append(errs, "inbound.pollWaitSeconds must be between 0 and 20")
+	}
+	if c.Inbound.MaxConcurrent <= 0 {
+		errs = append(errs, "inbound.maxConcurrent must be > 0")
+	}
+	if c.Inbound.VisibilityTimeoutSeconds <= 0 {
+		errs = append(errs, "inbound.visibilityTimeoutSeconds must be > 0")
+	}
+	if c.Inbound.Exchange.Host == "" {
+		errs = append(errs, "inbound.exchange.host is required")
+	}
+	if c.Inbound.Exchange.Port <= 0 || c.Inbound.Exchange.Port > 65535 {
+		errs = append(errs, "inbound.exchange.port must be 1-65535")
+	}
+	if (c.Inbound.Exchange.Username == "") != (c.Inbound.Exchange.Password == "") {
+		errs = append(errs, "inbound.exchange.username and password must both be set or both empty")
+	}
+
+	if c.Outbound.Listen == "" {
+		errs = append(errs, "outbound.listen is required")
+	} else if _, _, err := net.SplitHostPort(c.Outbound.Listen); err != nil {
+		errs = append(errs, fmt.Sprintf("outbound.listen %q is not host:port: %v", c.Outbound.Listen, err))
+	}
+	if c.Outbound.MaxMessageBytes <= 0 {
+		errs = append(errs, "outbound.maxMessageBytes must be > 0")
+	}
+	if len(c.Outbound.AllowedCIDRs) == 0 {
+		errs = append(errs, "outbound.allowedCidrs must list at least one CIDR")
+	} else {
+		c.Outbound.AllowedNets = make([]*net.IPNet, 0, len(c.Outbound.AllowedCIDRs))
+		for _, raw := range c.Outbound.AllowedCIDRs {
+			_, ipNet, err := net.ParseCIDR(raw)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("outbound.allowedCidrs: %q is not a valid CIDR: %v", raw, err))
+				continue
+			}
+			c.Outbound.AllowedNets = append(c.Outbound.AllowedNets, ipNet)
+		}
+	}
+	if (c.Outbound.TLS.CertFile == "") != (c.Outbound.TLS.KeyFile == "") {
+		errs = append(errs, "outbound.tls.certFile and keyFile must both be set or both empty")
+	}
+
+	switch strings.ToLower(c.Logging.Level) {
+	case "debug", "info", "warn", "warning", "error":
+	default:
+		errs = append(errs, fmt.Sprintf("logging.level %q is not one of debug|info|warn|error", c.Logging.Level))
+	}
+	if c.Logging.File != "" {
+		if c.Logging.MaxSizeMB <= 0 {
+			errs = append(errs, "logging.maxSizeMB must be > 0 when logging.file is set")
+		}
+		if c.Logging.MaxBackups < 0 {
+			errs = append(errs, "logging.maxBackups must be >= 0")
+		}
+		if c.Logging.MaxAgeDays < 0 {
+			errs = append(errs, "logging.maxAgeDays must be >= 0")
+		}
+	}
+
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// TLSEnabled reports whether the outbound SMTP listener should enable STARTTLS.
+func (t TLSConfig) TLSEnabled() bool {
+	return t.CertFile != "" && t.KeyFile != ""
+}
