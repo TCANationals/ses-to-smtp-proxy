@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go (build, vet, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go mod download
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: latest
+          install-go: false
+
+      - name: go test
+        run: go test ./... -race -count=1
+
+      - name: cross-compile windows/amd64
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -o /tmp/ses-smtp-proxy-amd64.exe ./cmd/ses-smtp-proxy
+
+      - name: cross-compile windows/arm64
+        env:
+          GOOS: windows
+          GOARCH: arm64
+        run: go build -o /tmp/ses-smtp-proxy-arm64.exe ./cmd/ses-smtp-proxy
+
+  cloudformation:
+    name: CloudFormation (cfn-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: scottbrenner/cfn-lint-action@v2
+
+      - name: cfn-lint
+        run: cfn-lint cloudformation/template.yaml
+
+  installer:
+    name: Installer (makensis syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install NSIS
+        run: sudo apt-get update && sudo apt-get install -y nsis
+
+      - name: stage a dummy exe for the installer
+        run: |
+          mkdir -p dist
+          : > dist/ses-smtp-proxy-amd64.exe
+
+      - name: makensis
+        run: |
+          makensis -V2 \
+            -DVERSION=ci \
+            -DARCH=amd64 \
+            -DEXE_PATH=../dist/ses-smtp-proxy-amd64.exe \
+            -DOUT_FILE=../dist/ses-smtp-proxy-ci-amd64-setup.exe \
+            installer/installer.nsi
