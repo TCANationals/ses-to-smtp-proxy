@@ -32,8 +32,8 @@ Commands:
 
 Flags:
   --config <path>  Override the configuration file path. When omitted, the
-                   service searches the executable directory and then
-                   %s.
+                   service loads %s from the same directory as the
+                   executable.
 `
 
 func run(args []string) error {
@@ -49,7 +49,7 @@ func run(args []string) error {
 		fmt.Println(version)
 		return nil
 	case "help", "--help", "-h":
-		fmt.Fprintf(os.Stdout, usage, version, config.ProgramDataPath)
+		fmt.Fprintf(os.Stdout, usage, version, config.DefaultFileName)
 		return nil
 	}
 
@@ -88,7 +88,7 @@ func runDefault() error {
 	if !service.Interactive() {
 		return runService("", nil)
 	}
-	fmt.Fprintf(os.Stderr, usage, version, config.ProgramDataPath)
+	fmt.Fprintf(os.Stderr, usage, version, config.DefaultFileName)
 	return errors.New("no command specified")
 }
 
@@ -173,8 +173,8 @@ func controlService(action, cfgPath string, extra []string) error {
 		// Best-effort warning if no config can be resolved yet.
 		if _, err := config.Resolve(cfgPath); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
-			fmt.Fprintf(os.Stderr, "the service will fail to start until %s exists\n",
-				config.ProgramDataPath)
+			fmt.Fprintln(os.Stderr,
+				"the service will fail to start until a config.yaml is placed next to the executable")
 		}
 	}
 

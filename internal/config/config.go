@@ -13,9 +13,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ProgramDataPath is the default Windows location for the configuration file.
-// It is also writable by the installer to seed config.yaml on first install.
-const ProgramDataPath = `C:\ProgramData\ses-smtp-proxy\config.yaml`
+// DefaultFileName is the basename of the configuration file the service
+// looks for next to the running executable.
+const DefaultFileName = "config.yaml"
 
 // Config is the top-level configuration object.
 type Config struct {
@@ -119,7 +119,6 @@ func Load(explicitPath string) (*Config, error) {
 //
 //  1. explicitPath if non-empty
 //  2. config.yaml next to the running executable
-//  3. C:\ProgramData\ses-smtp-proxy\config.yaml (Windows default)
 func Resolve(explicitPath string) (string, error) {
 	if explicitPath != "" {
 		abs, err := filepath.Abs(explicitPath)
@@ -132,18 +131,15 @@ func Resolve(explicitPath string) (string, error) {
 		return abs, nil
 	}
 
-	if exe, err := os.Executable(); err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "config.yaml")
-		if _, statErr := os.Stat(candidate); statErr == nil {
-			return candidate, nil
-		}
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locate executable: %w", err)
 	}
-
-	if _, err := os.Stat(ProgramDataPath); err == nil {
-		return ProgramDataPath, nil
+	candidate := filepath.Join(filepath.Dir(exe), DefaultFileName)
+	if _, err := os.Stat(candidate); err != nil {
+		return "", fmt.Errorf("config file %s: %w (pass --config to override)", candidate, err)
 	}
-
-	return "", fmt.Errorf("no config file found (tried exe-dir/config.yaml and %s)", ProgramDataPath)
+	return candidate, nil
 }
 
 func defaultConfig() *Config {

@@ -129,24 +129,21 @@ func TestResolveExplicitMissing(t *testing.T) {
 	}
 }
 
-func TestResolveExeDirPreferredOverProgramData(t *testing.T) {
-	dir := t.TempDir()
-	candidate := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(candidate, []byte(minimalValid), 0o600); err != nil {
-		t.Fatalf("write candidate: %v", err)
-	}
-
+func TestResolveExeDirFallback(t *testing.T) {
 	exe, err := os.Executable()
 	if err != nil {
 		t.Skipf("os.Executable failed: %v", err)
 	}
-	exeDirConfig := filepath.Join(filepath.Dir(exe), "config.yaml")
+	exeDirConfig := filepath.Join(filepath.Dir(exe), DefaultFileName)
 	if _, err := os.Stat(exeDirConfig); err == nil {
-		t.Skipf("real config exists at %s; cannot run search-order test", exeDirConfig)
+		t.Skipf("real config already exists at %s; cannot test the negative path", exeDirConfig)
 	}
 
-	// Sanity: Resolve("") should error on this host (no exe-dir or
-	// ProgramData config) - we don't assert the exact error since
-	// ProgramData may or may not exist on the host.
-	_, _ = Resolve("")
+	_, err = Resolve("")
+	if err == nil {
+		t.Fatal("expected error when no config exists next to the test binary")
+	}
+	if !strings.Contains(err.Error(), exeDirConfig) {
+		t.Errorf("error should mention the exe-dir path %q: %v", exeDirConfig, err)
+	}
 }

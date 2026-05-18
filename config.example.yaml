@@ -2,8 +2,8 @@
 #
 # Search order:
 #   1. --config <path> flag
-#   2. config.yaml next to the executable
-#   3. C:\ProgramData\ses-smtp-proxy\config.yaml
+#   2. config.yaml in the same directory as the executable
+#      (typically C:\Program Files\ses-smtp-proxy\config.yaml)
 #
 # Tip: most of the AWS-side values below can be generated automatically
 # by deploying cloudformation/template.yaml and pulling the ConfigYaml
@@ -11,7 +11,7 @@
 #
 #   aws cloudformation describe-stacks --stack-name ses-smtp-proxy \
 #     --query "Stacks[0].Outputs[?OutputKey=='ConfigYaml'].OutputValue" \
-#     --output text > config.yaml
+#     --output text > "C:\Program Files\ses-smtp-proxy\config.yaml"
 
 aws:
   region: us-east-1

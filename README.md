@@ -11,7 +11,8 @@ between SES and Exchange over private outbound connections only.
 
 - **Single static `.exe`**, no runtime dependencies.
 - **Runs as a Windows service**, registered automatically by the installer.
-- **YAML configuration on disk** (`C:\ProgramData\ses-smtp-proxy\config.yaml`).
+- **YAML configuration on disk**, alongside the executable (default
+  `C:\Program Files\ses-smtp-proxy\config.yaml`).
 - **Logs to the Windows Event Log** by default, or to a rotated file when
   configured.
 - **One-click NSIS installer** that registers the service, opens the
@@ -103,14 +104,15 @@ outbound HTTPS to SES/SQS/S3 and the loopback/LAN SMTP listener for Exchange.
          AlarmEmail=ops@example.com
    ```
 
-4. Retrieve the rendered `config.yaml` directly from the stack output:
+4. Retrieve the rendered `config.yaml` directly from the stack output. Run
+   this on the Exchange host once the installer has placed the binary there:
 
-   ```sh
-   aws cloudformation describe-stacks \
-     --stack-name ses-smtp-proxy \
-     --region us-east-1 \
-     --query "Stacks[0].Outputs[?OutputKey=='ConfigYaml'].OutputValue" \
-     --output text > config.yaml
+   ```powershell
+   aws cloudformation describe-stacks `
+     --stack-name ses-smtp-proxy `
+     --region us-east-1 `
+     --query "Stacks[0].Outputs[?OutputKey=='ConfigYaml'].OutputValue" `
+     --output text | Set-Content "C:\Program Files\ses-smtp-proxy\config.yaml"
    ```
 
    The result is a complete configuration file with the queue URL, S3 bucket,
@@ -153,16 +155,18 @@ SES drops inbound mail and rejects outbound `SendEmail` calls.
 1. Download the latest installer from the project's [Releases page]; pick the
    architecture that matches your Windows host (typically
    `ses-smtp-proxy-<version>-amd64-setup.exe`).
-2. Run the installer as Administrator. Components:
-   - **Service binary** (required) — copies the exe, creates
-     `C:\ProgramData\ses-smtp-proxy\{logs,tls}`, registers the Windows service
-     with auto-start and on-failure restart, and registers an Event Log source.
-   - **Sample config.yaml** — seeds a starter config only when none is
-     already present (upgrades preserve operator edits).
+2. Run the installer as Administrator. By default it installs to
+   `C:\Program Files\ses-smtp-proxy`. Components:
+   - **Service binary** (required) — copies `ses-smtp-proxy.exe`, registers
+     the Windows service with auto-start and on-failure restart, and
+     registers an Event Log source.
+   - **Sample config.yaml** — seeds a starter `config.yaml` in the install
+     directory only when none is already present (upgrades preserve operator
+     edits).
    - **Windows Firewall: inbound SMTP** — opens TCP/2525 inbound for the
      local SMTP listener.
 3. Save the CloudFormation-rendered config from the previous section to
-   `C:\ProgramData\ses-smtp-proxy\config.yaml`, overwriting the seeded
+   `C:\Program Files\ses-smtp-proxy\config.yaml`, overwriting the seeded
    sample.
 4. Edit `outbound.allowedCidrs` in the config to include the Exchange Send
    Connector source IP (typically the Exchange server itself).
@@ -369,8 +373,10 @@ cfn-lint cloudformation/template.yaml
   performs no privileged operations beyond binding its configured SMTP port.
   You can `sc config ses-smtp-proxy obj= "NT SERVICE\ses-smtp-proxy"` or a
   dedicated service account if your policy requires it.
-- AWS credentials live only in `C:\ProgramData\ses-smtp-proxy\config.yaml`,
-  which is ACL'd to administrators by default. Treat the file as sensitive.
+- AWS credentials live only in `config.yaml` next to the executable
+  (typically `C:\Program Files\ses-smtp-proxy\config.yaml`), which inherits
+  the default Program Files ACL (administrators read/write, users read).
+  Tighten the ACL with `icacls` if read access for `Users` is undesirable.
 - The IAM policy attached to the service user is least-privilege: it cannot
   modify the queue or bucket, cannot create new IAM resources, and can only
   send mail with a `From:` address inside the verified domain.

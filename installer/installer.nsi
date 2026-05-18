@@ -89,25 +89,20 @@ VIAddVersionKey "LegalCopyright"  "MIT-licensed open source software"
 ;------------------------------------------------------------------------------
 
 Var PreviousInstallDir
-Var ProgramDataRoot
-Var ConfigDir
 Var ConfigPath
 
-!macro ResolveProgramData target
-  ReadEnvStr ${target} "ProgramData"
-  ${If} ${target} == ""
-    StrCpy ${target} "C:\ProgramData"
-  ${EndIf}
-!macroend
-
 Function .onInit
-  !insertmacro ResolveProgramData $ProgramDataRoot
-  StrCpy $ConfigDir  "$ProgramDataRoot\${APP_NAME}"
-  StrCpy $ConfigPath "$ConfigDir\config.yaml"
+  StrCpy $ConfigPath "$INSTDIR\config.yaml"
 
   ; Detect a previous installation so we can stop+uninstall the old service
   ; before overwriting the exe.
   ReadRegStr $PreviousInstallDir HKLM "${UNINSTALL_KEY}" "InstallLocation"
+FunctionEnd
+
+; $INSTDIR is finalised after the directory page, so refresh $ConfigPath
+; before we use it during install.
+Function .onVerifyInstDir
+  StrCpy $ConfigPath "$INSTDIR\config.yaml"
 FunctionEnd
 
 ;------------------------------------------------------------------------------
@@ -131,11 +126,8 @@ Section "Service binary (required)" SecService
   SetOutPath "$INSTDIR"
   File /oname=${EXE_NAME} "${EXE_PATH}"
 
-  ; ProgramData layout: config + logs + tls live here so they survive upgrades
-  ; and uninstalls.
-  CreateDirectory "$ConfigDir"
-  CreateDirectory "$ConfigDir\logs"
-  CreateDirectory "$ConfigDir\tls"
+  ; Make sure $ConfigPath reflects the user-chosen $INSTDIR.
+  StrCpy $ConfigPath "$INSTDIR\config.yaml"
 
   ; Register the Windows service. This also installs an Event Log source so
   ; structured logging routes through the Windows Event Log when no
@@ -172,7 +164,7 @@ Section "Sample config.yaml" SecConfig
   ; preserve operator edits.
   ${IfNot} ${FileExists} "$ConfigPath"
     DetailPrint "Seeding $ConfigPath ..."
-    SetOutPath "$ConfigDir"
+    SetOutPath "$INSTDIR"
     File /oname=config.yaml "..\config.example.yaml"
   ${Else}
     DetailPrint "Existing $ConfigPath preserved."
@@ -192,7 +184,7 @@ SectionEnd
 ;------------------------------------------------------------------------------
 
 LangString DESC_SecService  ${LANG_ENGLISH} "Install ${EXE_NAME} and register the Windows service. Required."
-LangString DESC_SecConfig   ${LANG_ENGLISH} "Place a starter config.yaml in %ProgramData%\${APP_NAME}\. Skipped if a config already exists."
+LangString DESC_SecConfig   ${LANG_ENGLISH} "Place a starter config.yaml in the install directory. Skipped if a config already exists."
 LangString DESC_SecFirewall ${LANG_ENGLISH} "Allow inbound TCP/${DEFAULT_SMTP_PORT} so Exchange can relay outbound mail to the proxy."
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
@@ -215,11 +207,6 @@ FunctionEnd
 ; Uninstaller
 ;------------------------------------------------------------------------------
 
-Function un.onInit
-  !insertmacro ResolveProgramData $ProgramDataRoot
-  StrCpy $ConfigDir "$ProgramDataRoot\${APP_NAME}"
-FunctionEnd
-
 Section "Uninstall"
   DetailPrint "Stopping service..."
   nsExec::ExecToLog 'sc.exe stop "${SERVICE_NAME}"'
@@ -236,12 +223,16 @@ Section "Uninstall"
 
   Delete "$INSTDIR\${EXE_NAME}"
   Delete "$INSTDIR\uninstall.exe"
-  RMDir  "$INSTDIR"
+
+  ; Intentionally preserve $INSTDIR\config.yaml so operator edits are not
+  ; destroyed by an uninstall. RMDir without /r only removes the directory
+  ; when it is empty - so if the operator has deleted config.yaml beforehand,
+  ; the install dir is cleaned up; otherwise it (and the config) survive.
+  ${If} ${FileExists} "$INSTDIR\config.yaml"
+    DetailPrint "Preserved $INSTDIR\config.yaml. Delete it manually if no longer needed."
+  ${EndIf}
+  RMDir "$INSTDIR"
 
   DeleteRegKey HKLM "${UNINSTALL_KEY}"
   DeleteRegKey HKLM "Software\${APP_NAME}"
-
-  ; Intentionally leave $ConfigDir (logs, config, tls) in place. Operators
-  ; can delete it manually if they're sure they don't need the data.
-  DetailPrint "Note: $ConfigDir was preserved (contains config and logs)."
 SectionEnd
