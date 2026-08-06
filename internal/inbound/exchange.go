@@ -19,6 +19,12 @@ import (
 type relayError struct {
 	err       error
 	permanent bool
+	rejected  []recipientFailure
+}
+
+type recipientFailure struct {
+	Recipient  string
+	Diagnostic string
 }
 
 func (e *relayError) Error() string {
@@ -44,6 +50,21 @@ func IsPermanent(err error) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+func rejectedRecipients(err error) []recipientFailure {
+	for err != nil {
+		if r, ok := err.(*relayError); ok {
+			return r.rejected
+		}
+		type unwrapper interface{ Unwrap() error }
+		u, ok := err.(unwrapper)
+		if !ok {
+			return nil
+		}
+		err = u.Unwrap()
+	}
+	return nil
 }
 
 // relayToExchange opens an SMTP session to Exchange and transmits a single
@@ -98,9 +119,24 @@ func relayToExchange(cfg config.ExchangeConfig, from string, to []string, raw []
 	if err := client.Mail(from); err != nil {
 		return wrapSMTPError(err, "MAIL FROM")
 	}
+	accepted := 0
+	rejected := make([]recipientFailure, 0)
 	for _, rcpt := range to {
 		if err := client.Rcpt(rcpt); err != nil {
-			return wrapSMTPError(err, "RCPT TO "+rcpt)
+			wrapped := wrapSMTPError(err, "RCPT TO "+rcpt)
+			if !IsPermanent(wrapped) {
+				return wrapped
+			}
+			rejected = append(rejected, recipientFailure{Recipient: rcpt, Diagnostic: err.Error()})
+			continue
+		}
+		accepted++
+	}
+	if accepted == 0 {
+		return &relayError{
+			err:       fmt.Errorf("all recipients were rejected"),
+			permanent: true,
+			rejected:  rejected,
 		}
 	}
 
@@ -114,6 +150,13 @@ func relayToExchange(cfg config.ExchangeConfig, from string, to []string, raw []
 	}
 	if err := w.Close(); err != nil {
 		return wrapSMTPError(err, "DATA close")
+	}
+	if len(rejected) > 0 {
+		return &relayError{
+			err:       fmt.Errorf("%d recipient(s) rejected", len(rejected)),
+			permanent: true,
+			rejected:  rejected,
+		}
 	}
 	return nil
 }

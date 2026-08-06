@@ -39,9 +39,10 @@ func New(cfg config.OutboundConfig, clients *awsclient.Clients, log *slog.Logger
 	}
 
 	be := &backend{
-		allowed: cfg.AllowedNets,
-		ses:     clients.SES,
-		log:     s.log,
+		allowed:        cfg.AllowedNets,
+		nullSenderFrom: cfg.NullSenderFrom,
+		ses:            clients.SES,
+		log:            s.log,
 	}
 
 	srv := smtp.NewServer(be)
@@ -101,9 +102,10 @@ func (s *Server) Run(ctx context.Context) error {
 
 // backend implements smtp.Backend.
 type backend struct {
-	allowed []*net.IPNet
-	ses     sesSender
-	log     *slog.Logger
+	allowed        []*net.IPNet
+	nullSenderFrom string
+	ses            sesSender
+	log            *slog.Logger
 }
 
 func (b *backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
@@ -122,9 +124,10 @@ func (b *backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 		}
 	}
 	return &session{
-		log:        b.log.With("remoteAddr", raddr.String()),
-		ses:        b.ses,
-		recipients: make([]string, 0, 4),
+		log:            b.log.With("remoteAddr", raddr.String()),
+		ses:            b.ses,
+		nullSenderFrom: b.nullSenderFrom,
+		recipients:     make([]string, 0, 4),
 	}, nil
 }
 
@@ -139,10 +142,11 @@ func ipAllowed(ip net.IP, nets []*net.IPNet) bool {
 
 // session implements smtp.Session and is recreated per SMTP connection.
 type session struct {
-	log        *slog.Logger
-	ses        sesSender
-	from       string
-	recipients []string
+	log            *slog.Logger
+	ses            sesSender
+	nullSenderFrom string
+	from           string
+	recipients     []string
 }
 
 func (s *session) Reset() {
@@ -179,7 +183,11 @@ func (s *session) Data(r io.Reader) error {
 		"bytes", buf.Len(),
 	)
 
-	if s.from == "" {
+	effectiveFrom := s.from
+	if effectiveFrom == "" {
+		effectiveFrom = s.nullSenderFrom
+	}
+	if effectiveFrom == "" {
 		log.Warn("rejecting message with empty MAIL FROM")
 		return &smtp.SMTPError{
 			Code:         554,
@@ -196,7 +204,7 @@ func (s *session) Data(r io.Reader) error {
 		}
 	}
 
-	res := sendViaSES(context.Background(), s.ses, s.from, s.recipients, buf.Bytes())
+	res := sendViaSES(context.Background(), s.ses, effectiveFrom, s.recipients, buf.Bytes())
 	if res.err != nil {
 		if res.permanent {
 			log.Error("SES permanent failure", "err", res.err)

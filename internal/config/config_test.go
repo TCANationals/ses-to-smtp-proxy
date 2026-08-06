@@ -53,6 +53,35 @@ func TestLoadMinimalValid(t *testing.T) {
 	}
 }
 
+func TestLoadContestMailGuards(t *testing.T) {
+	configured := strings.Replace(minimalValid,
+		`"sqsQueueUrl":`,
+		`"recipientSuffix": ".42@example.com", "bounceSender": "postmaster.42@example.com", "sqsQueueUrl":`, 1)
+	configured = strings.Replace(configured,
+		`"allowedCidrs":`,
+		`"nullSenderFrom": "postmaster.42@example.com", "allowedCidrs":`, 1)
+	cfg, err := Load(writeTempConfig(t, configured))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Inbound.RecipientSuffix != ".42@example.com" ||
+		cfg.Inbound.BounceSender != "postmaster.42@example.com" ||
+		cfg.Outbound.NullSenderFrom != "postmaster.42@example.com" {
+		t.Fatalf("guard config not loaded: %#v %#v", cfg.Inbound, cfg.Outbound)
+	}
+}
+
+func TestLoadDefaultSMTPPort(t *testing.T) {
+	withoutListen := strings.Replace(minimalValid, `"listen": "0.0.0.0:2525",`, "", 1)
+	cfg, err := Load(writeTempConfig(t, withoutListen))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Outbound.Listen != "127.0.0.1:12525" {
+		t.Fatalf("default outbound.listen = %q", cfg.Outbound.Listen)
+	}
+}
+
 func TestLoadValidationErrors(t *testing.T) {
 	tests := []struct {
 		name string
@@ -97,6 +126,27 @@ func TestLoadValidationErrors(t *testing.T) {
 				`"sqsQueueUrl"`,
 				`"pollWaitSeconds": 30, "sqsQueueUrl"`, 1),
 			want: "inbound.pollWaitSeconds",
+		},
+		{
+			name: "malformed recipient suffix",
+			json: strings.Replace(minimalValid,
+				`"sqsQueueUrl":`,
+				`"recipientSuffix": ".42@@example.com", "sqsQueueUrl":`, 1),
+			want: "inbound.recipientSuffix",
+		},
+		{
+			name: "display name bounce sender",
+			json: strings.Replace(minimalValid,
+				`"sqsQueueUrl":`,
+				`"bounceSender": "Postmaster <postmaster.42@example.com>", "sqsQueueUrl":`, 1),
+			want: "inbound.bounceSender",
+		},
+		{
+			name: "malformed null sender substitute",
+			json: strings.Replace(minimalValid,
+				`"allowedCidrs":`,
+				`"nullSenderFrom": "not-an-address", "allowedCidrs":`, 1),
+			want: "outbound.nullSenderFrom",
 		},
 	}
 
