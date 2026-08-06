@@ -66,6 +66,15 @@ flowchart LR
 5. On 2xx the SQS message is deleted. On a transient failure the message
    becomes visible again after the visibility timeout; after `maxReceiveCount`
    redeliveries it lands in a dead-letter queue.
+6. Permanent recipient rejections do not redrive. The proxy delivers to any
+   recipients Exchange accepted, sends an RFC 3464 delivery-status notification
+   for only the rejected recipients when `inbound.bounceSender` is configured,
+   and then deletes the SQS message. If DSN delivery fails after Exchange
+   accepted at least one recipient, the proxy still deletes the SQS message to
+   prevent duplicate delivery; it redrives only when Exchange accepted no
+   recipients. Null senders, postmaster senders, and messages with an
+   `Auto-Submitted` value other than `no` are never bounced, preventing DSN
+   loops.
 
 ### Outbound (Exchange -> internet)
 
@@ -165,7 +174,7 @@ SES drops inbound mail and rejects outbound `SendEmail` calls.
    - **Sample config.json** — seeds a starter `config.json` in the install
      directory only when none is already present (upgrades preserve operator
      edits).
-   - **Windows Firewall: inbound SMTP** — opens TCP/2525 inbound for the
+   - **Windows Firewall: inbound SMTP** — opens TCP/12525 inbound for the
      local SMTP listener.
 3. Save the CloudFormation-rendered config from the previous section to
    `C:\Program Files\ses-smtp-proxy\config.json`, overwriting the seeded
@@ -201,7 +210,7 @@ the proxy's local SMTP listener:
 | Type | Custom |
 | Address space | SMTP, `*`, cost 1 |
 | Smart host | `[127.0.0.1]` (or the proxy host as an FQDN) |
-| Smart host port | `2525` (set via `-Port`) |
+| Smart host port | `12525` (set via `-Port`) |
 | Smart host auth | None |
 | Source servers | The Exchange server(s) authorised to relay |
 
@@ -220,7 +229,7 @@ New-SendConnector `
     -AddressSpaces "SMTP:*;1" `
     -DNSRoutingEnabled $false `
     -SmartHosts "[127.0.0.1]" `
-    -Port 2525 `
+    -Port 12525 `
     -SmartHostAuthMechanism None `
     -SourceTransportServers (Get-TransportService | Select-Object -ExpandProperty Name) `
     -ProtocolLoggingLevel Verbose `
@@ -258,6 +267,8 @@ fields (JSON does not support comments, so the documentation is here):
 | --- | --- | --- |
 | `sqsQueueUrl` | _required_ | Take from the `SqsQueueUrl` stack output. |
 | `s3Bucket` | empty | When set, messages referencing any other bucket are rejected as a safety check. |
+| `recipientSuffix` | empty | When set, every notification recipient must be a bare address ending with this lowercase suffix or the message is rejected before S3 is read. |
+| `bounceSender` | empty | Envelope and From address used for DSNs after a permanent Exchange rejection. Empty disables rejection DSNs. |
 | `pollWaitSeconds` | `20` | SQS long-poll wait. Max 20. |
 | `maxConcurrent` | `4` | Concurrent SMTP relays in flight. |
 | `visibilityTimeoutSeconds` | `300` | Should comfortably exceed the worst-case S3 fetch + SMTP relay time. |
@@ -271,9 +282,10 @@ fields (JSON does not support comments, so the documentation is here):
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `listen` | `127.0.0.1:2525` | Address Exchange's Send Connector relays to. |
+| `listen` | `127.0.0.1:12525` | Address Exchange's Send Connector relays to. |
 | `allowedCidrs` | _required_ | Connection source must match one of these CIDRs; everything else gets `554`. |
 | `maxMessageBytes` | `41943040` (40 MiB) | SES inbound cap. |
+| `nullSenderFrom` | empty | SES From address substituted for Exchange's null reverse path (`<>`), typically a scoped postmaster address. |
 | `tls.certFile` / `keyFile` | empty | Optional STARTTLS for the Exchange -> proxy hop. Leave empty on a trusted localhost link. |
 
 ### `logging`

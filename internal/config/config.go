@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/mail"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -42,6 +43,8 @@ type AWSConfig struct {
 type InboundConfig struct {
 	SQSQueueURL              string         `json:"sqsQueueUrl"`
 	S3Bucket                 string         `json:"s3Bucket"`
+	RecipientSuffix          string         `json:"recipientSuffix"`
+	BounceSender             string         `json:"bounceSender"`
 	PollWaitSeconds          int            `json:"pollWaitSeconds"`
 	MaxConcurrent            int            `json:"maxConcurrent"`
 	VisibilityTimeoutSeconds int            `json:"visibilityTimeoutSeconds"`
@@ -65,6 +68,7 @@ type OutboundConfig struct {
 	Listen          string    `json:"listen"`
 	AllowedCIDRs    []string  `json:"allowedCidrs"`
 	MaxMessageBytes int64     `json:"maxMessageBytes"`
+	NullSenderFrom  string    `json:"nullSenderFrom"`
 	TLS             TLSConfig `json:"tls"`
 
 	// AllowedNets is the parsed form of AllowedCIDRs, populated by Validate.
@@ -159,7 +163,7 @@ func defaultConfig() *Config {
 			},
 		},
 		Outbound: OutboundConfig{
-			Listen:          "127.0.0.1:2525",
+			Listen:          "127.0.0.1:12525",
 			MaxMessageBytes: 41943040,
 		},
 		Logging: LoggingConfig{
@@ -187,6 +191,19 @@ func (c *Config) Validate() error {
 	} else if u, err := url.Parse(c.Inbound.SQSQueueURL); err != nil || u.Scheme == "" || u.Host == "" {
 		errs = append(errs, "inbound.sqsQueueUrl is not a valid URL")
 	}
+	if c.Inbound.RecipientSuffix != "" {
+		if !strings.HasPrefix(c.Inbound.RecipientSuffix, ".") ||
+			strings.Count(c.Inbound.RecipientSuffix, "@") != 1 ||
+			!isMailbox("guard"+c.Inbound.RecipientSuffix) {
+			errs = append(errs, "inbound.recipientSuffix must look like .<environment>@<domain>")
+		}
+		if c.Inbound.RecipientSuffix != strings.ToLower(c.Inbound.RecipientSuffix) {
+			errs = append(errs, "inbound.recipientSuffix must be lowercase")
+		}
+	}
+	if c.Inbound.BounceSender != "" && !isMailbox(c.Inbound.BounceSender) {
+		errs = append(errs, "inbound.bounceSender must be a bare email address")
+	}
 	if c.Inbound.PollWaitSeconds < 0 || c.Inbound.PollWaitSeconds > 20 {
 		errs = append(errs, "inbound.pollWaitSeconds must be between 0 and 20")
 	}
@@ -213,6 +230,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Outbound.MaxMessageBytes <= 0 {
 		errs = append(errs, "outbound.maxMessageBytes must be > 0")
+	}
+	if c.Outbound.NullSenderFrom != "" && !isMailbox(c.Outbound.NullSenderFrom) {
+		errs = append(errs, "outbound.nullSenderFrom must be a bare email address")
 	}
 	if len(c.Outbound.AllowedCIDRs) == 0 {
 		errs = append(errs, "outbound.allowedCidrs must list at least one CIDR")
@@ -252,6 +272,11 @@ func (c *Config) Validate() error {
 		return errors.New(strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func isMailbox(raw string) bool {
+	parsed, err := mail.ParseAddress(raw)
+	return err == nil && parsed.Address == raw
 }
 
 // TLSEnabled reports whether the outbound SMTP listener should enable STARTTLS.

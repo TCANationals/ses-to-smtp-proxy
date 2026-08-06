@@ -11,6 +11,8 @@
     "pollWaitSeconds": 20,
     "maxConcurrent": 4,
     "visibilityTimeoutSeconds": 300,
+    "recipientSuffix": "",
+    "bounceSender": "",
     "exchange": {
       "host": "127.0.0.1",
       "port": 25,
@@ -22,11 +24,12 @@
     }
   },
   "outbound": {
-    "listen": "127.0.0.1:2525",
+    "listen": "127.0.0.1:12525",
     "allowedCidrs": [
       "127.0.0.1/32"
     ],
     "maxMessageBytes": 41943040,
+    "nullSenderFrom": "",
     "tls": {
       "certFile": "",
       "keyFile": ""

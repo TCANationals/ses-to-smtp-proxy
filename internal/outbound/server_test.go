@@ -111,6 +111,40 @@ func TestSession_RelaysToSES(t *testing.T) {
 	}
 }
 
+func TestSession_NullReversePathUsesConfiguredSender(t *testing.T) {
+	ses := &fakeSES{}
+	be := newBackend(t, []string{"127.0.0.0/8"}, ses)
+	be.nullSenderFrom = "postmaster.42@example.com"
+	addr, stop := startTestServer(t, be)
+	defer stop()
+
+	client, err := smtp.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Mail(""); err != nil {
+		t.Fatalf("MAIL FROM <>: %v", err)
+	}
+	if err := client.Rcpt("alice@external.example"); err != nil {
+		t.Fatalf("RCPT TO: %v", err)
+	}
+	w, err := client.Data()
+	if err != nil {
+		t.Fatalf("DATA: %v", err)
+	}
+	_, _ = w.Write([]byte("Subject: NDR\r\n\r\nfailed\r\n"))
+	if err := w.Close(); err != nil {
+		t.Fatalf("close DATA: %v", err)
+	}
+
+	ses.mu.Lock()
+	defer ses.mu.Unlock()
+	if got := aws.ToString(ses.last.FromEmailAddress); got != "postmaster.42@example.com" {
+		t.Fatalf("FromEmailAddress = %q", got)
+	}
+}
+
 func TestSession_RejectsDisallowedIP(t *testing.T) {
 	ses := &fakeSES{}
 	be := newBackend(t, []string{"10.0.0.0/8"}, ses)
@@ -137,9 +171,9 @@ type stubAPIError struct {
 	fault smithy.ErrorFault
 }
 
-func (e *stubAPIError) Error() string          { return e.code + ": stub" }
-func (e *stubAPIError) ErrorCode() string      { return e.code }
-func (e *stubAPIError) ErrorMessage() string   { return "stub" }
+func (e *stubAPIError) Error() string                 { return e.code + ": stub" }
+func (e *stubAPIError) ErrorCode() string             { return e.code }
+func (e *stubAPIError) ErrorMessage() string          { return "stub" }
 func (e *stubAPIError) ErrorFault() smithy.ErrorFault { return e.fault }
 
 func TestSession_TransientSESErrorBecomes451(t *testing.T) {

@@ -18,20 +18,26 @@ type fakeSMTPServer struct {
 	listener net.Listener
 	addr     string
 
-	mu       sync.Mutex
-	from     string
-	to       []string
-	data     strings.Builder
-	gotQuit  bool
+	mu               sync.Mutex
+	from             string
+	to               []string
+	data             strings.Builder
+	gotQuit          bool
+	rejectRecipients map[string]string
 }
 
-func newFakeSMTPServer(t *testing.T) *fakeSMTPServer {
+func newFakeSMTPServer(t *testing.T, rejectRecipients map[string]string) *fakeSMTPServer {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv := &fakeSMTPServer{t: t, listener: l, addr: l.Addr().String()}
+	srv := &fakeSMTPServer{
+		t:                t,
+		listener:         l,
+		addr:             l.Addr().String(),
+		rejectRecipients: rejectRecipients,
+	}
 	go srv.accept()
 	return srv
 }
@@ -84,8 +90,13 @@ func (s *fakeSMTPServer) accept() {
 			s.mu.Unlock()
 			write("250 OK")
 		case strings.HasPrefix(upper, "RCPT TO:"):
+			rcpt := stripAngle(strings.TrimSpace(line[len("RCPT TO:"):]))
+			if response, reject := s.rejectRecipients[rcpt]; reject {
+				write(response)
+				continue
+			}
 			s.mu.Lock()
-			s.to = append(s.to, stripAngle(strings.TrimSpace(line[len("RCPT TO:"):])))
+			s.to = append(s.to, rcpt)
 			s.mu.Unlock()
 			write("250 OK")
 		case upper == "DATA":
@@ -103,6 +114,41 @@ func (s *fakeSMTPServer) accept() {
 	}
 }
 
+func TestRelayToExchangeContinuesAfterPermanentRecipientRejection(t *testing.T) {
+	srv := newFakeSMTPServer(t, map[string]string{
+		"missing@example.com": "550 5.1.1 mailbox unavailable",
+	})
+	defer srv.Close()
+
+	host, port, err := net.SplitHostPort(srv.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.ExchangeConfig{Host: host, Port: atoi(t, port), HeloDomain: "test.local"}
+	raw := []byte("Subject: partial\r\n\r\nhello\r\n")
+	err = relayToExchange(cfg, "sender@external.example",
+		[]string{"missing@example.com", "alice@example.com"}, raw)
+	if err == nil || !IsPermanent(err) {
+		t.Fatalf("relay error = %v, want permanent partial-recipient error", err)
+	}
+	failures := rejectedRecipients(err)
+	if len(failures) != 1 || failures[0].Recipient != "missing@example.com" {
+		t.Fatalf("rejected recipients = %#v", failures)
+	}
+	if got := acceptedRecipientCount(err); got != 1 {
+		t.Fatalf("accepted recipient count = %d, want 1", got)
+	}
+
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if len(srv.to) != 1 || srv.to[0] != "alice@example.com" {
+		t.Fatalf("accepted recipients = %v", srv.to)
+	}
+	if !strings.Contains(srv.data.String(), "hello") {
+		t.Fatalf("accepted recipient did not receive DATA: %q", srv.data.String())
+	}
+}
+
 func (s *fakeSMTPServer) Close() {
 	_ = s.listener.Close()
 }
@@ -115,7 +161,7 @@ func stripAngle(s string) string {
 }
 
 func TestRelayToExchange(t *testing.T) {
-	srv := newFakeSMTPServer(t)
+	srv := newFakeSMTPServer(t, nil)
 	defer srv.Close()
 
 	host, port, err := net.SplitHostPort(srv.addr)

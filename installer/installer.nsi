@@ -30,7 +30,7 @@
 !define SERVICE_NAME        "ses-smtp-proxy"
 !define EXE_NAME            "ses-smtp-proxy.exe"
 !define UNINSTALL_KEY       "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"
-!define DEFAULT_SMTP_PORT   "2525"
+!define DEFAULT_SMTP_PORT   "12525"
 
 ;------------------------------------------------------------------------------
 ; General configuration

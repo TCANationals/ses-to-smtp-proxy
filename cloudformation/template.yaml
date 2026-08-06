@@ -43,7 +43,7 @@ Parameters:
 
   SmtpListenPort:
     Type: Number
-    Default: 2525
+    Default: 12525
     Description: Default value used in the rendered ConfigYaml output for outbound.listen port.
 
   AdoptExistingEmailIdentity:
@@ -581,6 +581,8 @@ Outputs:
             "pollWaitSeconds": 20,
             "maxConcurrent": 4,
             "visibilityTimeoutSeconds": 300,
+            "recipientSuffix": "",
+            "bounceSender": "",
             "exchange": {
               "host": "${SmtpExchangeHost}",
               "port": 25,
@@ -595,6 +597,7 @@ Outputs:
             "listen": "127.0.0.1:${SmtpListenPort}",
             "allowedCidrs": ["127.0.0.1/32"],
             "maxMessageBytes": 41943040,
+            "nullSenderFrom": "",
             "tls": {
               "certFile": "",
               "keyFile": ""

@@ -11,10 +11,18 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
+	"net/mail"
+	"net/textproto"
+	"regexp"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sesv2"
+	"github.com/aws/aws-sdk-go-v2/service/sesv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 
@@ -26,13 +34,40 @@ import (
 // referenced MIME messages to Exchange.
 type Worker struct {
 	cfg     config.InboundConfig
-	clients *awsclient.Clients
+	clients workerClients
 	log     *slog.Logger
+}
+
+type sqsClient interface {
+	ReceiveMessage(context.Context, *sqs.ReceiveMessageInput, ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
+	DeleteMessage(context.Context, *sqs.DeleteMessageInput, ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
+}
+
+type s3Client interface {
+	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+}
+
+type sesClient interface {
+	SendEmail(context.Context, *sesv2.SendEmailInput, ...func(*sesv2.Options)) (*sesv2.SendEmailOutput, error)
+}
+
+type workerClients struct {
+	SQS sqsClient
+	S3  s3Client
+	SES sesClient
 }
 
 // New constructs a Worker. Run starts the polling loop.
 func New(cfg config.InboundConfig, clients *awsclient.Clients, log *slog.Logger) *Worker {
-	return &Worker{cfg: cfg, clients: clients, log: log.With("component", "inbound")}
+	return &Worker{
+		cfg: cfg,
+		clients: workerClients{
+			SQS: clients.SQS,
+			S3:  clients.S3,
+			SES: clients.SES,
+		},
+		log: log.With("component", "inbound"),
+	}
 }
 
 // Run polls SQS until ctx is cancelled. It returns ctx.Err() on graceful
@@ -107,6 +142,13 @@ func (w *Worker) handleMessage(ctx context.Context, msg sqstypes.Message) {
 		w.deleteMessage(ctx, log, msg)
 		return
 	}
+	if !recipientsMatchSuffix(notif.Mail.Destination, w.cfg.RecipientSuffix) {
+		log.Error("notification contains a recipient outside the configured suffix - dropping message",
+			"recipientSuffix", w.cfg.RecipientSuffix,
+			"recipients", notif.Mail.Destination)
+		w.deleteMessage(ctx, log, msg)
+		return
+	}
 
 	bucket := notif.Receipt.Action.BucketName
 	if w.cfg.S3Bucket != "" && bucket != w.cfg.S3Bucket {
@@ -133,7 +175,32 @@ func (w *Worker) handleMessage(ctx context.Context, msg sqstypes.Message) {
 
 	if err := relayToExchange(w.cfg.Exchange, notif.Mail.Source, notif.Mail.Destination, raw); err != nil {
 		if IsPermanent(err) {
-			log.Error("permanent SMTP failure - dropping message", "err", err)
+			failures := rejectedRecipients(err)
+			if len(failures) == 0 {
+				failures = make([]recipientFailure, 0, len(notif.Mail.Destination))
+				for _, recipient := range notif.Mail.Destination {
+					failures = append(failures, recipientFailure{
+						Recipient:  recipient,
+						Diagnostic: err.Error(),
+					})
+				}
+			}
+			if shouldBounce(notif.Mail.Source, raw) && w.cfg.BounceSender != "" {
+				if bounceErr := w.sendRejectionDSN(ctx, notif, raw, failures); bounceErr != nil {
+					if accepted := acceptedRecipientCount(err); accepted > 0 {
+						log.Error("partial SMTP delivery succeeded but rejection DSN failed - deleting message to prevent duplicate delivery",
+							"err", err, "bounceErr", bounceErr, "acceptedRecipients", accepted)
+						w.deleteMessage(ctx, log, msg)
+						return
+					}
+					log.Error("permanent SMTP failure and rejection DSN failed - leaving message for redrive",
+						"err", err, "bounceErr", bounceErr, "acceptedRecipients", 0)
+					return
+				}
+				log.Info("sent rejection DSN", "rejectedRecipients", len(failures))
+			} else {
+				log.Warn("permanent SMTP failure cannot be bounced", "err", err)
+			}
 			w.deleteMessage(ctx, log, msg)
 			return
 		}
@@ -143,6 +210,162 @@ func (w *Worker) handleMessage(ctx context.Context, msg sqstypes.Message) {
 
 	log.Info("relayed email to Exchange")
 	w.deleteMessage(ctx, log, msg)
+}
+
+func recipientsMatchSuffix(recipients []string, suffix string) bool {
+	if suffix == "" {
+		return true
+	}
+	if len(recipients) == 0 {
+		return false
+	}
+	suffix = strings.ToLower(suffix)
+	for _, recipient := range recipients {
+		parsed, err := mail.ParseAddress(recipient)
+		if err != nil || parsed.Address != recipient ||
+			!strings.HasSuffix(strings.ToLower(parsed.Address), suffix) {
+			return false
+		}
+	}
+	return true
+}
+
+func shouldBounce(sender string, original []byte) bool {
+	if sender == "" {
+		return false
+	}
+	parsed, err := mail.ParseAddress(sender)
+	if err != nil || parsed.Address != sender {
+		return false
+	}
+	message, err := mail.ReadMessage(bytes.NewReader(original))
+	if err == nil {
+		autoSubmitted := strings.TrimSpace(message.Header.Get("Auto-Submitted"))
+		value, _, _ := strings.Cut(autoSubmitted, ";")
+		if autoSubmitted != "" && !strings.EqualFold(strings.TrimSpace(value), "no") {
+			return false
+		}
+	}
+	local, _, ok := strings.Cut(strings.ToLower(parsed.Address), "@")
+	return ok && !strings.HasPrefix(local, "postmaster")
+}
+
+func (w *Worker) sendRejectionDSN(
+	ctx context.Context,
+	notif *sesNotification,
+	original []byte,
+	failures []recipientFailure,
+) error {
+	raw, err := buildRejectionDSN(
+		w.cfg.BounceSender,
+		notif.Mail.Source,
+		reportingMTADomain(w.cfg.Exchange.HeloDomain, w.cfg.BounceSender),
+		notif.Mail.MessageID,
+		failures,
+		original,
+	)
+	if err != nil {
+		return err
+	}
+	_, err = w.clients.SES.SendEmail(ctx, &sesv2.SendEmailInput{
+		FromEmailAddress: aws.String(w.cfg.BounceSender),
+		Destination:      &types.Destination{ToAddresses: []string{notif.Mail.Source}},
+		Content:          &types.EmailContent{Raw: &types.RawMessage{Data: raw}},
+	})
+	return err
+}
+
+var enhancedStatusPattern = regexp.MustCompile(`\b(5\.\d+\.\d+)\b`)
+
+func reportingMTADomain(heloDomain, bounceSender string) string {
+	if domain := strings.TrimSpace(heloDomain); domain != "" {
+		return domain
+	}
+	parsed, err := mail.ParseAddress(bounceSender)
+	if err == nil {
+		if _, domain, ok := strings.Cut(parsed.Address, "@"); ok && domain != "" {
+			return domain
+		}
+	}
+	return "localhost.localdomain"
+}
+
+func buildRejectionDSN(
+	from string,
+	to string,
+	reportingMTA string,
+	originalMessageID string,
+	failures []recipientFailure,
+	original []byte,
+) ([]byte, error) {
+	var body bytes.Buffer
+	multi := multipart.NewWriter(&body)
+
+	textHeader := textproto.MIMEHeader{}
+	textHeader.Set("Content-Type", "text/plain; charset=utf-8")
+	textPart, err := multi.CreatePart(textHeader)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = fmt.Fprintf(textPart,
+		"Your message could not be delivered to one or more recipients.\r\n\r\n")
+	for _, failure := range failures {
+		_, _ = fmt.Fprintf(textPart, "  %s: %s\r\n", failure.Recipient, sanitizeDSNField(failure.Diagnostic))
+	}
+
+	statusHeader := textproto.MIMEHeader{}
+	statusHeader.Set("Content-Type", "message/delivery-status")
+	statusPart, err := multi.CreatePart(statusHeader)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = fmt.Fprintf(statusPart, "Reporting-MTA: dns; %s\r\n", sanitizeDSNField(reportingMTA))
+	if originalMessageID != "" {
+		_, _ = fmt.Fprintf(statusPart, "Original-Envelope-Id: %s\r\n", sanitizeDSNField(originalMessageID))
+	}
+	for _, failure := range failures {
+		status := "5.0.0"
+		if match := enhancedStatusPattern.FindStringSubmatch(failure.Diagnostic); len(match) == 2 {
+			status = match[1]
+		}
+		_, _ = fmt.Fprintf(statusPart,
+			"\r\nFinal-Recipient: rfc822; %s\r\nAction: failed\r\nStatus: %s\r\nDiagnostic-Code: smtp; %s\r\n",
+			sanitizeDSNField(failure.Recipient), status, sanitizeDSNField(failure.Diagnostic))
+	}
+
+	headersPartHeader := textproto.MIMEHeader{}
+	headersPartHeader.Set("Content-Type", "message/rfc822-headers")
+	headersPart, err := multi.CreatePart(headersPartHeader)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = headersPart.Write(originalHeaders(original))
+	if err := multi.Close(); err != nil {
+		return nil, err
+	}
+
+	var message bytes.Buffer
+	_, _ = fmt.Fprintf(&message,
+		"From: Mail Delivery Subsystem <%s>\r\nTo: <%s>\r\nDate: %s\r\nSubject: Delivery Status Notification (Failure)\r\nAuto-Submitted: auto-replied\r\nMIME-Version: 1.0\r\nContent-Type: multipart/report; report-type=delivery-status; boundary=%q\r\n\r\n",
+		from, to, time.Now().UTC().Format(time.RFC1123Z), multi.Boundary())
+	_, _ = message.Write(body.Bytes())
+	return message.Bytes(), nil
+}
+
+func originalHeaders(raw []byte) []byte {
+	if index := bytes.Index(raw, []byte("\r\n\r\n")); index >= 0 {
+		return raw[:index+2]
+	}
+	if index := bytes.Index(raw, []byte("\n\n")); index >= 0 {
+		return raw[:index+1]
+	}
+	return raw
+}
+
+func sanitizeDSNField(value string) string {
+	value = strings.ReplaceAll(value, "\r", " ")
+	value = strings.ReplaceAll(value, "\n", " ")
+	return strings.TrimSpace(value)
 }
 
 func (w *Worker) fetchS3Object(ctx context.Context, bucket, key string) ([]byte, error) {
