@@ -69,8 +69,12 @@ flowchart LR
 6. Permanent recipient rejections do not redrive. The proxy delivers to any
    recipients Exchange accepted, sends an RFC 3464 delivery-status notification
    for only the rejected recipients when `inbound.bounceSender` is configured,
-   and then deletes the SQS message. Null and postmaster senders are never
-   bounced, preventing DSN loops.
+   and then deletes the SQS message. If DSN delivery fails after Exchange
+   accepted at least one recipient, the proxy still deletes the SQS message to
+   prevent duplicate delivery; it redrives only when Exchange accepted no
+   recipients. Null senders, postmaster senders, and messages with an
+   `Auto-Submitted` value other than `no` are never bounced, preventing DSN
+   loops.
 
 ### Outbound (Exchange -> internet)
 

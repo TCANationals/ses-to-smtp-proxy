@@ -26,13 +26,18 @@ type fakeSMTPServer struct {
 	rejectRecipients map[string]string
 }
 
-func newFakeSMTPServer(t *testing.T) *fakeSMTPServer {
+func newFakeSMTPServer(t *testing.T, rejectRecipients map[string]string) *fakeSMTPServer {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	srv := &fakeSMTPServer{t: t, listener: l, addr: l.Addr().String()}
+	srv := &fakeSMTPServer{
+		t:                t,
+		listener:         l,
+		addr:             l.Addr().String(),
+		rejectRecipients: rejectRecipients,
+	}
 	go srv.accept()
 	return srv
 }
@@ -110,10 +115,9 @@ func (s *fakeSMTPServer) accept() {
 }
 
 func TestRelayToExchangeContinuesAfterPermanentRecipientRejection(t *testing.T) {
-	srv := newFakeSMTPServer(t)
-	srv.rejectRecipients = map[string]string{
+	srv := newFakeSMTPServer(t, map[string]string{
 		"missing@example.com": "550 5.1.1 mailbox unavailable",
-	}
+	})
 	defer srv.Close()
 
 	host, port, err := net.SplitHostPort(srv.addr)
@@ -130,6 +134,9 @@ func TestRelayToExchangeContinuesAfterPermanentRecipientRejection(t *testing.T) 
 	failures := rejectedRecipients(err)
 	if len(failures) != 1 || failures[0].Recipient != "missing@example.com" {
 		t.Fatalf("rejected recipients = %#v", failures)
+	}
+	if got := acceptedRecipientCount(err); got != 1 {
+		t.Fatalf("accepted recipient count = %d, want 1", got)
 	}
 
 	srv.mu.Lock()
@@ -154,7 +161,7 @@ func stripAngle(s string) string {
 }
 
 func TestRelayToExchange(t *testing.T) {
-	srv := newFakeSMTPServer(t)
+	srv := newFakeSMTPServer(t, nil)
 	defer srv.Close()
 
 	host, port, err := net.SplitHostPort(srv.addr)

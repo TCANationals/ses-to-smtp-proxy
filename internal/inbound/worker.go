@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -184,10 +185,16 @@ func (w *Worker) handleMessage(ctx context.Context, msg sqstypes.Message) {
 					})
 				}
 			}
-			if shouldBounce(notif.Mail.Source) && w.cfg.BounceSender != "" {
+			if shouldBounce(notif.Mail.Source, raw) && w.cfg.BounceSender != "" {
 				if bounceErr := w.sendRejectionDSN(ctx, notif, raw, failures); bounceErr != nil {
+					if accepted := acceptedRecipientCount(err); accepted > 0 {
+						log.Error("partial SMTP delivery succeeded but rejection DSN failed - deleting message to prevent duplicate delivery",
+							"err", err, "bounceErr", bounceErr, "acceptedRecipients", accepted)
+						w.deleteMessage(ctx, log, msg)
+						return
+					}
 					log.Error("permanent SMTP failure and rejection DSN failed - leaving message for redrive",
-						"err", err, "bounceErr", bounceErr)
+						"err", err, "bounceErr", bounceErr, "acceptedRecipients", 0)
 					return
 				}
 				log.Info("sent rejection DSN", "rejectedRecipients", len(failures))
@@ -223,13 +230,21 @@ func recipientsMatchSuffix(recipients []string, suffix string) bool {
 	return true
 }
 
-func shouldBounce(sender string) bool {
+func shouldBounce(sender string, original []byte) bool {
 	if sender == "" {
 		return false
 	}
 	parsed, err := mail.ParseAddress(sender)
 	if err != nil || parsed.Address != sender {
 		return false
+	}
+	message, err := mail.ReadMessage(bytes.NewReader(original))
+	if err == nil {
+		autoSubmitted := strings.TrimSpace(message.Header.Get("Auto-Submitted"))
+		value, _, _ := strings.Cut(autoSubmitted, ";")
+		if autoSubmitted != "" && !strings.EqualFold(strings.TrimSpace(value), "no") {
+			return false
+		}
 	}
 	local, _, ok := strings.Cut(strings.ToLower(parsed.Address), "@")
 	return ok && !strings.HasPrefix(local, "postmaster")
@@ -241,7 +256,14 @@ func (w *Worker) sendRejectionDSN(
 	original []byte,
 	failures []recipientFailure,
 ) error {
-	raw, err := buildRejectionDSN(w.cfg.BounceSender, notif.Mail.Source, notif.Mail.MessageID, failures, original)
+	raw, err := buildRejectionDSN(
+		w.cfg.BounceSender,
+		notif.Mail.Source,
+		reportingMTADomain(w.cfg.Exchange.HeloDomain, w.cfg.BounceSender),
+		notif.Mail.MessageID,
+		failures,
+		original,
+	)
 	if err != nil {
 		return err
 	}
@@ -253,11 +275,25 @@ func (w *Worker) sendRejectionDSN(
 	return err
 }
 
-var enhancedStatusPattern = regexp.MustCompile(`\b(5\.\d\.\d)\b`)
+var enhancedStatusPattern = regexp.MustCompile(`\b(5\.\d+\.\d+)\b`)
+
+func reportingMTADomain(heloDomain, bounceSender string) string {
+	if domain := strings.TrimSpace(heloDomain); domain != "" {
+		return domain
+	}
+	parsed, err := mail.ParseAddress(bounceSender)
+	if err == nil {
+		if _, domain, ok := strings.Cut(parsed.Address, "@"); ok && domain != "" {
+			return domain
+		}
+	}
+	return "localhost.localdomain"
+}
 
 func buildRejectionDSN(
 	from string,
 	to string,
+	reportingMTA string,
 	originalMessageID string,
 	failures []recipientFailure,
 	original []byte,
@@ -283,7 +319,7 @@ func buildRejectionDSN(
 	if err != nil {
 		return nil, err
 	}
-	_, _ = fmt.Fprintf(statusPart, "Reporting-MTA: dns; ses-smtp-proxy\r\n")
+	_, _ = fmt.Fprintf(statusPart, "Reporting-MTA: dns; %s\r\n", sanitizeDSNField(reportingMTA))
 	if originalMessageID != "" {
 		_, _ = fmt.Fprintf(statusPart, "Original-Envelope-Id: %s\r\n", sanitizeDSNField(originalMessageID))
 	}
@@ -310,8 +346,8 @@ func buildRejectionDSN(
 
 	var message bytes.Buffer
 	_, _ = fmt.Fprintf(&message,
-		"From: Mail Delivery Subsystem <%s>\r\nTo: <%s>\r\nSubject: Delivery Status Notification (Failure)\r\nAuto-Submitted: auto-replied\r\nMIME-Version: 1.0\r\nContent-Type: multipart/report; report-type=delivery-status; boundary=%q\r\n\r\n",
-		from, to, multi.Boundary())
+		"From: Mail Delivery Subsystem <%s>\r\nTo: <%s>\r\nDate: %s\r\nSubject: Delivery Status Notification (Failure)\r\nAuto-Submitted: auto-replied\r\nMIME-Version: 1.0\r\nContent-Type: multipart/report; report-type=delivery-status; boundary=%q\r\n\r\n",
+		from, to, time.Now().UTC().Format(time.RFC1123Z), multi.Boundary())
 	_, _ = message.Write(body.Bytes())
 	return message.Bytes(), nil
 }

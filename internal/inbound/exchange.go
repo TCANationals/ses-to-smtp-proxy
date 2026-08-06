@@ -20,6 +20,7 @@ type relayError struct {
 	err       error
 	permanent bool
 	rejected  []recipientFailure
+	accepted  int
 }
 
 type recipientFailure struct {
@@ -65,6 +66,21 @@ func rejectedRecipients(err error) []recipientFailure {
 		err = u.Unwrap()
 	}
 	return nil
+}
+
+func acceptedRecipientCount(err error) int {
+	for err != nil {
+		if r, ok := err.(*relayError); ok {
+			return r.accepted
+		}
+		type unwrapper interface{ Unwrap() error }
+		u, ok := err.(unwrapper)
+		if !ok {
+			return 0
+		}
+		err = u.Unwrap()
+	}
+	return 0
 }
 
 // relayToExchange opens an SMTP session to Exchange and transmits a single
@@ -156,6 +172,7 @@ func relayToExchange(cfg config.ExchangeConfig, from string, to []string, raw []
 			err:       fmt.Errorf("%d recipient(s) rejected", len(rejected)),
 			permanent: true,
 			rejected:  rejected,
+			accepted:  accepted,
 		}
 	}
 	return nil

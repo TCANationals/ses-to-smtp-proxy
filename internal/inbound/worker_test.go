@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/mail"
 	"strings"
 	"testing"
 
@@ -56,6 +57,7 @@ func (f *fakeWorkerS3) GetObject(
 
 type fakeWorkerSES struct {
 	inputs []*sesv2.SendEmailInput
+	err    error
 }
 
 func (f *fakeWorkerSES) SendEmail(
@@ -64,6 +66,9 @@ func (f *fakeWorkerSES) SendEmail(
 	_ ...func(*sesv2.Options),
 ) (*sesv2.SendEmailOutput, error) {
 	f.inputs = append(f.inputs, in)
+	if f.err != nil {
+		return nil, f.err
+	}
 	return &sesv2.SendEmailOutput{}, nil
 }
 
@@ -110,10 +115,9 @@ func TestHandleMessageRejectsRecipientOutsideSuffixBeforeS3Fetch(t *testing.T) {
 }
 
 func TestHandleMessagePartialRecipientRejectionSendsDSNAndDeletes(t *testing.T) {
-	smtpServer := newFakeSMTPServer(t)
-	smtpServer.rejectRecipients = map[string]string{
+	smtpServer := newFakeSMTPServer(t, map[string]string{
 		"missing.42@example.com": "550 5.1.1 mailbox unavailable",
-	}
+	})
 	defer smtpServer.Close()
 
 	host, portString, found := strings.Cut(smtpServer.addr, ":")
@@ -160,6 +164,72 @@ func TestHandleMessagePartialRecipientRejectionSendsDSNAndDeletes(t *testing.T) 
 	}
 	if !strings.Contains(smtpServer.data.String(), "secret body") {
 		t.Fatal("Exchange did not receive the message for the accepted recipient")
+	}
+}
+
+func TestHandleMessagePartialRecipientRejectionDeletesWhenDSNFails(t *testing.T) {
+	smtpServer := newFakeSMTPServer(t, map[string]string{
+		"missing.42@example.com": "550 5.1.1 mailbox unavailable",
+	})
+	defer smtpServer.Close()
+
+	host, portString, found := strings.Cut(smtpServer.addr, ":")
+	if !found || host == "" {
+		t.Fatalf("split SMTP address %q", smtpServer.addr)
+	}
+
+	sqsClient := &fakeWorkerSQS{}
+	s3Client := &fakeWorkerS3{raw: []byte(
+		"From: sender@external.example\r\nSubject: original\r\n\r\nsecret body\r\n")}
+	sesClient := &fakeWorkerSES{err: errors.New("SES throttling")}
+	w := newTestWorker(t, sqsClient, s3Client, sesClient, host, atoi(t, portString))
+
+	w.handleMessage(context.Background(), notificationMessage(t,
+		"sender@external.example",
+		[]string{"missing.42@example.com", "alice.42@example.com"}))
+
+	if len(sesClient.inputs) != 1 {
+		t.Fatalf("SES SendEmail calls = %d, want 1", len(sesClient.inputs))
+	}
+	if sqsClient.deleteCalls != 1 {
+		t.Fatalf("SQS DeleteMessage calls = %d, want 1 after partial delivery", sqsClient.deleteCalls)
+	}
+
+	smtpServer.mu.Lock()
+	defer smtpServer.mu.Unlock()
+	if len(smtpServer.to) != 1 || smtpServer.to[0] != "alice.42@example.com" {
+		t.Fatalf("Exchange accepted recipients = %v", smtpServer.to)
+	}
+	if !strings.Contains(smtpServer.data.String(), "secret body") {
+		t.Fatal("Exchange did not receive the message for the accepted recipient")
+	}
+}
+
+func TestHandleMessageAllRecipientsRejectedRedrivesWhenDSNFails(t *testing.T) {
+	smtpServer := newFakeSMTPServer(t, map[string]string{
+		"missing.42@example.com": "550 5.1.1 mailbox unavailable",
+	})
+	defer smtpServer.Close()
+
+	host, portString, found := strings.Cut(smtpServer.addr, ":")
+	if !found || host == "" {
+		t.Fatalf("split SMTP address %q", smtpServer.addr)
+	}
+
+	sqsClient := &fakeWorkerSQS{}
+	s3Client := &fakeWorkerS3{raw: []byte(
+		"From: sender@external.example\r\nSubject: original\r\n\r\nsecret body\r\n")}
+	sesClient := &fakeWorkerSES{err: errors.New("SES throttling")}
+	w := newTestWorker(t, sqsClient, s3Client, sesClient, host, atoi(t, portString))
+
+	w.handleMessage(context.Background(), notificationMessage(t,
+		"sender@external.example", []string{"missing.42@example.com"}))
+
+	if len(sesClient.inputs) != 1 {
+		t.Fatalf("SES SendEmail calls = %d, want 1", len(sesClient.inputs))
+	}
+	if sqsClient.deleteCalls != 0 {
+		t.Fatalf("SQS DeleteMessage calls = %d, want 0 when nothing was delivered", sqsClient.deleteCalls)
 	}
 }
 
@@ -220,6 +290,7 @@ func TestBuildRejectionDSN(t *testing.T) {
 	raw, err := buildRejectionDSN(
 		"postmaster.42@example.com",
 		"sender@external.example",
+		"relay.example.com",
 		"ses-message-id",
 		[]recipientFailure{{
 			Recipient:  "missing.42@example.com",
@@ -233,6 +304,7 @@ func TestBuildRejectionDSN(t *testing.T) {
 	for _, want := range []string{
 		"Content-Type: multipart/report; report-type=delivery-status",
 		"Auto-Submitted: auto-replied",
+		"Reporting-MTA: dns; relay.example.com",
 		"Final-Recipient: rfc822; missing.42@example.com",
 		"Action: failed",
 		"Status: 5.1.1",
@@ -246,15 +318,53 @@ func TestBuildRejectionDSN(t *testing.T) {
 	if strings.Contains(string(raw), "secret body") {
 		t.Fatal("DSN included original message body")
 	}
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("parse DSN: %v", err)
+	}
+	if _, err := mail.ParseDate(message.Header.Get("Date")); err != nil {
+		t.Fatalf("DSN Date header is missing or invalid: %v", err)
+	}
 }
 
 func TestShouldBounceLoopGuard(t *testing.T) {
 	for _, sender := range []string{"", "postmaster@example.com", "postmaster.42@example.com", "bad address"} {
-		if shouldBounce(sender) {
+		if shouldBounce(sender, []byte("Subject: test\r\n\r\nbody")) {
 			t.Errorf("shouldBounce(%q) = true", sender)
 		}
 	}
-	if !shouldBounce("sender@external.example") {
+	if !shouldBounce("sender@external.example", []byte("Subject: test\r\n\r\nbody")) {
 		t.Fatal("ordinary sender should be bounceable")
+	}
+	if !shouldBounce("sender@external.example", []byte("Auto-Submitted: no\r\n\r\nbody")) {
+		t.Fatal("Auto-Submitted: no should be bounceable")
+	}
+	for _, value := range []string{"auto-replied", "auto-generated; owner-email=owner@example.com"} {
+		raw := []byte("Auto-Submitted: " + value + "\r\n\r\nbody")
+		if shouldBounce("sender@external.example", raw) {
+			t.Errorf("Auto-Submitted: %s should not be bounceable", value)
+		}
+	}
+}
+
+func TestEnhancedStatusPatternSupportsMultiDigitSubfields(t *testing.T) {
+	for _, test := range []struct {
+		diagnostic string
+		want       string
+	}{
+		{diagnostic: "550 5.1.1 mailbox unavailable", want: "5.1.1"},
+		{diagnostic: "550 5.7.26 unauthenticated email", want: "5.7.26"},
+		{diagnostic: "550 5.7.509 access denied", want: "5.7.509"},
+	} {
+		match := enhancedStatusPattern.FindStringSubmatch(test.diagnostic)
+		if len(match) != 2 || match[1] != test.want {
+			t.Errorf("enhanced status in %q = %v, want %q", test.diagnostic, match, test.want)
+		}
+	}
+}
+
+func TestReportingMTADomainFallsBackToBounceSenderDomain(t *testing.T) {
+	if got := reportingMTADomain("", "postmaster.42@example.com"); got != "example.com" {
+		t.Fatalf("reporting MTA domain = %q, want example.com", got)
 	}
 }
