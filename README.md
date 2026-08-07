@@ -83,7 +83,11 @@ flowchart LR
 2. The proxy verifies the connecting IP against the configured allowlist and
    buffers the message.
 3. The MIME payload is sent to SES via `SendEmail` with `Content.Raw`,
-   preserving the original envelope.
+   preserving the original envelope. The SES source keeps a matching display
+   name from the MIME `From` header; when Exchange supplies only an address,
+   the proxy derives the friendly name from the username portion of an
+   environment-qualified local part (for example, `alice.42@example.com`
+   becomes `alice <alice.42@example.com>`).
 4. SES delivers to the public internet.
 
 The proxy never accepts inbound connections from the public internet — only

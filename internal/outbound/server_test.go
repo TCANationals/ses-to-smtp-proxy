@@ -90,7 +90,7 @@ func TestSession_RelaysToSES(t *testing.T) {
 
 	if err := smtp.SendMail(addr, nil, "bob@external.example",
 		[]string{"alice@example.com", "carol@example.com"},
-		[]byte("Subject: hi\r\nFrom: bob@external.example\r\nTo: alice@example.com\r\n\r\nhi\r\n"),
+		[]byte("Subject: hi\r\nFrom: Bob User <bob@external.example>\r\nTo: alice@example.com\r\n\r\nhi\r\n"),
 	); err != nil {
 		t.Fatalf("SendMail: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestSession_RelaysToSES(t *testing.T) {
 	}
 	ses.mu.Lock()
 	defer ses.mu.Unlock()
-	if aws.ToString(ses.last.FromEmailAddress) != "bob@external.example" {
+	if aws.ToString(ses.last.FromEmailAddress) != `"Bob User" <bob@external.example>` {
 		t.Errorf("FromEmailAddress = %q", aws.ToString(ses.last.FromEmailAddress))
 	}
 	if got, want := ses.last.Destination.ToAddresses, []string{"alice@example.com", "carol@example.com"}; !equalSlice(got, want) {
@@ -108,6 +108,36 @@ func TestSession_RelaysToSES(t *testing.T) {
 	}
 	if !bytes.Contains(ses.last.Content.Raw.Data, []byte("Subject: hi")) {
 		t.Errorf("raw content missing subject: %q", ses.last.Content.Raw.Data)
+	}
+}
+
+func TestSendViaSESAddsUsernameWhenFromHasNoDisplayName(t *testing.T) {
+	ses := &fakeSES{}
+	raw := []byte("From: first.last.42@example.com\r\nSubject: hi\r\n\r\nhello\r\n")
+
+	result := sendViaSES(
+		context.Background(),
+		ses,
+		"first.last.42@example.com",
+		[]string{"recipient@external.example"},
+		raw,
+	)
+	if result.err != nil {
+		t.Fatalf("sendViaSES: %v", result.err)
+	}
+
+	ses.mu.Lock()
+	defer ses.mu.Unlock()
+	if got, want := aws.ToString(ses.last.FromEmailAddress), `"first.last" <first.last.42@example.com>`; got != want {
+		t.Fatalf("FromEmailAddress = %q, want %q", got, want)
+	}
+}
+
+func TestSESFromAddressDoesNotTrustMismatchedHeaderAddress(t *testing.T) {
+	raw := []byte("From: Spoofed Name <attacker@external.example>\r\nSubject: hi\r\n\r\nhello\r\n")
+
+	if got, want := sesFromAddress("alice.42@example.com", raw), `"alice" <alice.42@example.com>`; got != want {
+		t.Fatalf("sesFromAddress = %q, want %q", got, want)
 	}
 }
 
@@ -140,7 +170,7 @@ func TestSession_NullReversePathUsesConfiguredSender(t *testing.T) {
 
 	ses.mu.Lock()
 	defer ses.mu.Unlock()
-	if got := aws.ToString(ses.last.FromEmailAddress); got != "postmaster.42@example.com" {
+	if got := aws.ToString(ses.last.FromEmailAddress); got != `"postmaster" <postmaster.42@example.com>` {
 		t.Fatalf("FromEmailAddress = %q", got)
 	}
 }

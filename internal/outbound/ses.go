@@ -1,9 +1,12 @@
 package outbound
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"net/mail"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sesv2"
@@ -25,7 +28,7 @@ type sendResult struct {
 
 func sendViaSES(ctx context.Context, client sesSender, from string, to []string, raw []byte) sendResult {
 	out, err := client.SendEmail(ctx, &sesv2.SendEmailInput{
-		FromEmailAddress: aws.String(from),
+		FromEmailAddress: aws.String(sesFromAddress(from, raw)),
 		Destination: &types.Destination{
 			ToAddresses: to,
 		},
@@ -37,6 +40,58 @@ func sendViaSES(ctx context.Context, client sesSender, from string, to []string,
 		return sendResult{err: err, permanent: isPermanentSESError(err)}
 	}
 	return sendResult{messageID: aws.ToString(out.MessageId)}
+}
+
+// sesFromAddress returns an SES source with a friendly display name while
+// keeping the SMTP envelope sender authoritative. Exchange normally supplies
+// the mailbox display name in the MIME From header. If it does not, derive the
+// username from the environment-qualified local part (for example,
+// alice.42@example.com becomes alice <alice.42@example.com>).
+func sesFromAddress(envelopeFrom string, raw []byte) string {
+	displayName := messageFromDisplayName(raw, envelopeFrom)
+	if displayName == "" {
+		displayName = usernameFromAddress(envelopeFrom)
+	}
+	if displayName == "" {
+		return envelopeFrom
+	}
+	return (&mail.Address{Name: displayName, Address: envelopeFrom}).String()
+}
+
+func messageFromDisplayName(raw []byte, envelopeFrom string) string {
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return ""
+	}
+	from, err := mail.ParseAddress(message.Header.Get("From"))
+	if err != nil || !strings.EqualFold(from.Address, envelopeFrom) {
+		return ""
+	}
+	return strings.TrimSpace(from.Name)
+}
+
+func usernameFromAddress(address string) string {
+	at := strings.LastIndexByte(address, '@')
+	if at <= 0 {
+		return ""
+	}
+	username := address[:at]
+	if dot := strings.LastIndexByte(username, '.'); dot > 0 && allDigits(username[dot+1:]) {
+		username = username[:dot]
+	}
+	return username
+}
+
+func allDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // isPermanentSESError reports whether err from SES is a permanent failure
